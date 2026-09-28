@@ -1,0 +1,10 @@
+[project]
+name = "autodiff"
+version = "0.1.0"
+description = "Minimal computation-graph autodiff engine on numpy"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
