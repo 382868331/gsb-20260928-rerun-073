@@ -7,6 +7,39 @@ from autodiff.nn import mse_loss, softmax_ce_loss, binary_cross_entropy_with_log
 from tests.grad_check import numerical_grad, assert_close
 
 
+def _stochastic_sequence(w, x, checkpointed=(False, False), draw_calls=None, effects=None):
+    def maybe_checkpoint(fn, value, enabled):
+        return ad.checkpoint(fn, value) if enabled else fn(value)
+
+    def block1(value):
+        noise = ad.checkpoint_randn(4, seed=100)
+        if effects is not None:
+            def record_block1():
+                if draw_calls is not None:
+                    draw_calls.append(noise.data.copy())
+                effects.append("block1")
+
+            ad.checkpoint_side_effect(record_block1)
+        return ad.tanh(value @ w + noise * 0.01)
+
+    def block2(value):
+        noise = ad.checkpoint_randn(4, seed=101)
+        if effects is not None:
+            def record_block2():
+                if draw_calls is not None:
+                    draw_calls.append(noise.data.copy())
+                effects.append("block2")
+
+            ad.checkpoint_side_effect(record_block2)
+        return ad.relu(value + noise * 0.01)
+
+    h1 = maybe_checkpoint(block1, x, checkpointed[0])
+    h2 = maybe_checkpoint(block2, h1, checkpointed[1])
+    branch1 = (h2 * 2).sum()
+    branch2 = ((h1 - 0.1) ** 2).sum()
+    return branch1 + branch2
+
+
 # ------------------------------------------------------------- scalar basics
 def test_add_mul_div_pow_scalar():
     x = tensor(2.0, requires_grad=True)
@@ -137,6 +170,123 @@ def test_two_backwards_accumulate_and_repeat():
     assert_close(x.grad.data, num, rtol=1e-3)
     x.zero_grad()
     assert x.grad is None
+
+
+# --------------------------------------------------------- recomputation
+def test_checkpoint_matches_eager_loss_and_gradients_for_multiple_regions():
+    x = ad.randn(5, 3, seed=20)
+    eager_w = ad.randn(3, 4, seed=21, requires_grad=True)
+    checkpoint_w = ad.randn(3, 4, seed=21, requires_grad=True)
+    eager_draws: list[np.ndarray] = []
+    checkpoint_draws: list[np.ndarray] = []
+    eager_effects: list[str] = []
+    checkpoint_effects: list[str] = []
+
+    eager_loss = _stochastic_sequence(eager_w, x, (False, False), eager_draws, eager_effects)
+    checkpoint_loss = _stochastic_sequence(
+        checkpoint_w, x, (True, True), checkpoint_draws, checkpoint_effects
+    )
+    eager_loss.backward()
+    checkpoint_loss.backward()
+
+    assert_close(checkpoint_loss.data, eager_loss.data)
+    assert_close(checkpoint_w.grad.data, eager_w.grad.data)
+    assert len(checkpoint_draws) == len(eager_draws) == 2
+    for actual, expected in zip(checkpoint_draws, eager_draws):
+        assert_close(actual, expected)
+    assert checkpoint_effects == ["block1", "block2"]
+
+    checkpoint_w.zero_grad()
+    checkpoint_loss.backward()
+    assert checkpoint_effects == ["block1", "block2"]
+    assert_close(checkpoint_w.grad.data, eager_w.grad.data)
+
+
+@pytest.mark.parametrize("regions", [
+    (False, False),
+    (True, False),
+    (False, True),
+    (True, True),
+])
+def test_different_checkpoint_regions_match_eager_baseline(regions):
+    x = ad.randn(5, 3, seed=30)
+    baseline_w = ad.randn(3, 4, seed=31, requires_grad=True)
+    current_w = ad.randn(3, 4, seed=31, requires_grad=True)
+    baseline_loss = _stochastic_sequence(baseline_w, x, (False, False))
+    current_loss = _stochastic_sequence(current_w, x, regions)
+    baseline_loss.backward()
+    current_loss.backward()
+    assert_close(current_loss.data, baseline_loss.data)
+    assert_close(current_w.grad.data, baseline_w.grad.data)
+
+
+def test_checkpoint_accumulates_shared_parameter_branches():
+    w = ad.randn(3, 2, seed=22, requires_grad=True)
+    x = ad.randn(4, 3, seed=23)
+
+    def shared_block(value):
+        return ad.relu(value @ w)
+
+    h = ad.checkpoint(shared_block, x)
+    loss = (h * 3).sum() + (h ** 2).sum()
+    loss.backward()
+
+    expected_h = np.maximum(x.data @ w.data, 0)
+    grad_h = 3 + 2 * expected_h
+    expected = x.data.T @ (grad_h * (expected_h > 0))
+    assert_close(w.grad.data, expected)
+
+
+def test_checkpoint_rejects_graph_after_parameter_update():
+    w = ad.randn(2, 2, seed=24, requires_grad=True)
+    x = ad.randn(3, 2, seed=25)
+    loss = ad.checkpoint(lambda value: (value @ w).sum(), x)
+    w.add_(0.1)
+    with pytest.raises(RuntimeError, match="modified in place"):
+        loss.backward()
+
+
+def test_consecutive_training_and_save_restore_do_not_reuse_graph(tmp_path):
+    x = ad.randn(8, 3, seed=26)
+    y = ad.randn(8, 2, seed=27)
+    model = nn.Sequential(nn.Linear(3, 4, seed=28), nn.ReLU(), nn.Linear(4, 2, seed=29))
+    opt = optim.SGD(model.parameters(), lr=0.05)
+    losses = []
+
+    for _ in range(3):
+        opt.zero_grad()
+        loss = ad.checkpoint(lambda: mse_loss(model(x), y))
+        loss.backward()
+        opt.step()
+        losses.append(float(loss.data))
+
+    snapshot = tmp_path / "model.npz"
+    np.savez(snapshot, **{str(i): p.data for i, p in enumerate(model.parameters())})
+
+    stale_loss = ad.checkpoint(lambda: mse_loss(model(x), y))
+    restored_expected_loss = float(stale_loss.data)
+    opt.zero_grad()
+    stale_loss.backward()
+    old_grads = [p.grad.data.copy() for p in model.parameters()]
+    opt.step()
+    with pytest.raises(RuntimeError, match="modified in place"):
+        stale_loss.backward()
+
+    restored = nn.Sequential(nn.Linear(3, 4, seed=99), nn.ReLU(), nn.Linear(4, 2, seed=100))
+    values = np.load(snapshot)
+    restored.layers[0].weight.data = values["0"]
+    restored.layers[0].bias.data = values["1"]
+    restored.layers[2].weight.data = values["2"]
+    restored.layers[2].bias.data = values["3"]
+
+    restored_opt = optim.SGD(restored.parameters(), lr=0.05)
+    restored_loss = ad.checkpoint(lambda: mse_loss(restored(x), y))
+    restored_loss.backward()
+    restored_opt.step()
+    assert abs(float(restored_loss.data) - restored_expected_loss) < 1e-12
+    for p, old_grad in zip(restored.parameters(), old_grads):
+        assert p.grad is not None
+        assert_close(p.grad.data, old_grad)
 
 
 # ------------------------------------------------------ in-place invalidation

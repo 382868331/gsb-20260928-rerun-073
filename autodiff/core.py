@@ -165,8 +165,18 @@ class Tensor:
                 )
             node._check_versions()
             upstream = node_grads[id(node)]
-            grads = node.backward(upstream)
-            for parent, pg in zip(node.parents, grads):
+            from .checkpoint import Checkpoint, _backward_checkpoint
+
+            if isinstance(node, Checkpoint):
+                checkpoint_grads = _backward_checkpoint(node, [upstream])
+                parent_pairs = [
+                    (parent, checkpoint_grads.get(id(parent), np.zeros_like(parent.data)))
+                    for parent in node.parents
+                ]
+            else:
+                parent_pairs = zip(node.parents, node.backward(upstream))
+
+            for parent, pg in parent_pairs:
                 if pg is None or not parent.requires_grad:
                     continue
                 if pg.shape != parent.data.shape:
