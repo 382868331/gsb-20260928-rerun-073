@@ -33,6 +33,22 @@ class Module:
         for p in self.parameters():
             p.zero_grad()
 
+    def state_dict(self) -> dict:
+        """Snapshot parameters as plain numpy arrays (name -> array)."""
+        return {f"param_{i}": p.data.copy() for i, p in enumerate(self.parameters())}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore parameters; assigning .data bumps versions, so any graph
+        built before the load is invalidated and cannot be backpropagated."""
+        params = self.parameters()
+        if len(state) != len(params):
+            raise ValueError(f"state has {len(state)} entries, model has {len(params)} parameters")
+        for i, p in enumerate(params):
+            value = np.asarray(state[f"param_{i}"], dtype=np.float64)
+            if value.shape != p.shape:
+                raise ValueError(f"shape mismatch for param_{i}: {value.shape} vs {p.shape}")
+            p.data = value
+
 
 class Linear(Module):
     """y = x @ W + b; W: (in_features, out_features), b: (out_features,)."""
@@ -55,6 +71,28 @@ class ReLU(Module):
 class Sigmoid(Module):
     def forward(self, x: Tensor) -> Tensor:
         return sigmoid(x)
+
+
+
+class Dropout(Module):
+    """Inverted dropout; draws from the global RNG (seed with manual_seed).
+
+    Inside checkpoint segments the mask is re-drawn identically during
+    recomputation because the RNG state is restored.
+    """
+
+    def __init__(self, p: float = 0.5):
+        if not 0.0 <= p < 1.0:
+            raise ValueError("dropout probability must be in [0, 1)")
+        self.p = float(p)
+        self.training = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+        from .core import rand
+        mask = rand(*x.shape).data >= self.p
+        return x * Tensor(mask.astype(np.float64) / (1.0 - self.p))
 
 
 class Sequential(Module):

@@ -7,6 +7,7 @@ user still holds) -- there is no global tape / global graph registry.
 """
 from __future__ import annotations
 
+import weakref
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable
 
@@ -14,6 +15,31 @@ import numpy as np
 
 
 _GRAD_STACK: list[bool] = []
+
+# Weak registry of every live Tensor; checkpointing snapshots versions
+# from it so in-place modification of *closed-over* tensors (not just
+# explicit arguments) also invalidates the saved segment.
+_ALL_TENSORS: weakref.WeakSet = weakref.WeakSet()
+
+# Process-level RNG used by random ops (``randn``/``rand`` without an explicit
+# ``seed``).  Checkpointing snapshots and restores this generator's state so
+# recomputation reproduces the exact draws of the original forward pass
+# without advancing the generator a second time (no duplicated side effects).
+_GLOBAL_RNG = np.random.default_rng()
+
+
+def manual_seed(seed: int) -> None:
+    """Seed the global RNG used by random ops."""
+    global _GLOBAL_RNG
+    _GLOBAL_RNG = np.random.default_rng(seed)
+
+
+def _rng_state() -> dict:
+    return _GLOBAL_RNG.bit_generator.state
+
+
+def _restore_rng(state: dict) -> None:
+    _GLOBAL_RNG.bit_generator.state = state
 
 
 @contextmanager
@@ -92,6 +118,7 @@ class Tensor:
         self._grad_fn = grad_fn
         self.grad: Tensor | None = None
         self._version = 0
+        _ALL_TENSORS.add(self)
 
     # ------------------------------------------------------------------ data
     @property
@@ -288,8 +315,13 @@ def ones_like(t: Tensor) -> Tensor:
 
 
 def randn(*shape, seed: int | None = None, requires_grad: bool = False) -> Tensor:
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed) if seed is not None else _GLOBAL_RNG
     return Tensor(rng.standard_normal(_shape(shape)), requires_grad=requires_grad)
+
+
+def rand(*shape, seed: int | None = None, requires_grad: bool = False) -> Tensor:
+    rng = np.random.default_rng(seed) if seed is not None else _GLOBAL_RNG
+    return Tensor(rng.uniform(0.0, 1.0, _shape(shape)), requires_grad=requires_grad)
 
 
 def _shape(shape: Iterable) -> tuple[int, ...]:

@@ -71,6 +71,29 @@ python -m pytest -q
 - 优化器在 `no_grad` 下通过受控的 `add_` 更新参数，因此上一步的图在
   更新后自动失效——训练循环必须每步重新前向（与 PyTorch 一致）。
 
+## 中间状态重算（gradient checkpointing）
+
+长序列前向不必保存全部中间值：`checkpoint(fn, *args)` 只保留段的输入/输出，
+反传时重放 `fn` 重建局部图；`checkpoint_sequential(layers, x, segments)` 把层序列
+切成若干重算区间。短序列直接保留全部状态即可，两者损失与梯度完全一致
+（`tests/test_checkpoint.py` 对照验证）。
+
+- **无副作用重放**：随机算子（`randn`/`rand`/`nn.Dropout`，用 `manual_seed` 播种）
+  走全局 RNG；段边界保存 RNG 状态，重算前恢复，因此重放取样与本次前向**完全相同**，
+  且不会第二次推进生成器——重算没有外部可见副作用。
+- **梯度累计**：共享参数、多分支汇合的梯度与全保留图一致；闭包捕获的参数在
+  重算时照常累计 `.grad`。
+- **失效检测**：checkpoint 记录前向时所有存活张量的版本，前向后任何被引用的
+  参数被原地修改（含优化器更新、`load_state_dict`），`backward()` 仍抛
+  `RuntimeError`，不会混用上一轮计算图。
+- `fn` 只应依赖传入的张量参数与闭包参数并返回单个 `Tensor`；只有参数会被
+  做版本检查。参数全部不需要梯度而闭包参数需要时，传 `requires_grad=True`。
+
+## 保存与恢复
+
+`Module.state_dict()` / `load_state_dict()` 以 numpy 数组快照/恢复参数；恢复通过
+`.data` 赋值递增版本号，加载前构建的旧图自动失效。
+
 ## 正确性验证
 
 `tests/` 使用**中心差分数值梯度**独立核对所有核心算子与组合图
@@ -91,6 +114,7 @@ autodiff/
   ops.py    # 可微算子与广播反向
   nn.py     # Module / Linear / Sequential / 损失函数
   optim.py  # SGD(momentum) / Adam
+  checkpoint.py  # 中间状态重算（gradient checkpointing）
 tests/      # 数值梯度核对 + 行为测试
 examples/   # 端到端训练示例
 ```
