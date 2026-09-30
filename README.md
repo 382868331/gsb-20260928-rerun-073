@@ -89,6 +89,49 @@ python -m pytest -q
 - `fn` 只应依赖传入的张量参数与闭包参数并返回单个 `Tensor`；只有参数会被
   做版本检查。参数全部不需要梯度而闭包参数需要时，传 `requires_grad=True`。
 
+### 重算中的外部事件（不能靠“调用者保证纯函数”）
+
+随机算子通过保存/恢复 RNG 状态保证重放等价；任意**外部效果**（网络请求、计数、
+写文件、扣费……）没有这层保证，直接写在 `fn` 里会在前向一次、反向重算再发生一次。
+因此外部效果必须显式登记：
+
+```python
+from autodiff import EventLog, record_external_event, use_event_log, checkpoint
+
+log = EventLog("train-events.jsonl")
+
+def segment(t):
+    # 前向：真正调用 fetch_minibatch()；反向重算/重复 backward：直接返回已记录结果，
+    # 回调绝不会被再次调用。
+    batch = record_external_event("step-12-batch", fetch_minibatch)
+    return model(t + as_tensor(batch))
+
+with use_event_log(log):
+    loss = checkpoint(segment, x)
+loss.backward()          # 不产生第二次外部效果；日志追加内部 replay 记录
+```
+
+- **用户可见事件 vs 内部重算**：事件日志（`autodiff.events.EventLog`）里外部效果
+  记为 `event`（`submitted` → `committed` 两条），重算只追加 `replay` 条目，可用
+  `log.events()` / `log.replays()` 分别查看。
+- **无法支持时提前拒绝**：重算遇到未登记的事件、没有事件日志、或事件仍停留在
+  `submitted` 时，抛 `ReplayExternalEventError` / `PendingExternalEventError`，
+  发生在任何回调执行**之前**，不会重复产生效果。
+- **幂等标识**：`event_id` 必须在前向、重算、重启重放之间稳定（如
+  `"step-12-batch"`）；重复提交同一已确认 id 直接返回原结果。
+
+### 保存重开与失败回退
+
+`EventLog(path)` 使用 append-only、每行 fsync 的 JSONL 持久化：
+
+- 重新打开日志后重跑某一步，已 `committed` 的事件**不会再次提交**，返回原结果；
+  配合 `Module.state_dict()`/`load_state_dict()` 保存参数即可断点续训（见
+  `examples/resumable_training.py`）。
+- 效果产生**前**先落盘 `submitted`。若回调失败或进程崩溃，重新打开日志会抛
+  `PendingExternalEventError`：该效果“可能已经发生”，系统不会自动重试或回滚。
+  人工核对外部系统后调用 `log.resolve_pending(event_id, result=...)` 显式确认——
+  日志只追加、从不删除，因此失败回退无法抹掉真实发生过的效果。
+
 ## 保存与恢复
 
 `Module.state_dict()` / `load_state_dict()` 以 numpy 数组快照/恢复参数；恢复通过
@@ -115,6 +158,7 @@ autodiff/
   nn.py     # Module / Linear / Sequential / 损失函数
   optim.py  # SGD(momentum) / Adam
   checkpoint.py  # 中间状态重算（gradient checkpointing）
+  events.py      # 外部事件登记 + 持久化训练事件日志（EventLog）
 tests/      # 数值梯度核对 + 行为测试
 examples/   # 端到端训练示例
 ```

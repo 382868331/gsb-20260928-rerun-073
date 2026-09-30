@@ -11,6 +11,11 @@ Guarantees:
   before recomputation, so random ops (dropout, randn ...) draw the *same*
   samples as in the original forward, and the generator is not advanced a
   second time -- recomputation has no externally visible side effects.
+* Arbitrary external effects go through
+  ``autodiff.events.record_external_event``: during recomputation the user
+  callback is never invoked again, its recorded result is returned, and an
+  internal ``replay`` entry is logged. Effects without a recorded result are
+  rejected with ``ReplayExternalEventError`` *before* anything is re-done.
 * Inputs are re-checked by version: mutating a parameter in place after the
   forward pass still invalidates the graph and raises RuntimeError.
 * Gradients of parameters shared across segments / branches accumulate
@@ -25,14 +30,16 @@ import numpy as np
 import weakref
 
 from .core import _ALL_TENSORS, Function, Tensor, _grad_enabled, _restore_rng, _rng_state, no_grad
+from .events import _replay_scope, current_log
 
 
 class _CheckpointFn(Function):
     """Backward node that recomputes its segment instead of storing it."""
 
-    def __init__(self, fn: Callable[..., Tensor], rng_state: dict, versions):
+    def __init__(self, fn: Callable[..., Tensor], rng_state: dict, versions, event_log):
         self.fn = fn
         self.rng_state = rng_state
+        self.event_log = event_log
         # (weakref, version) of every grad-requiring tensor alive at forward;
         # catches in-place updates to tensors closed over by fn.
         self._versions = versions
@@ -45,28 +52,44 @@ class _CheckpointFn(Function):
                     'one of the tensors needed by this graph was modified in place; '
                     'the graph is no longer valid for backward()'
                 )
-        # Replay the segment with the same random draws as the first pass.
-        _restore_rng(self.rng_state)
-        detached = [
-            Tensor(p.data.copy(), requires_grad=p.requires_grad) for p in self.parents
-        ]
-        out = self.fn(*detached)
-        if not isinstance(out, Tensor) or not out.requires_grad:
-            raise RuntimeError(
-                "checkpointed function must return a single Tensor that requires grad"
-            )
-        out.backward(grad_out)
-        grads = []
-        for d in detached:
-            grads.append(d.grad.data if d.grad is not None else np.zeros_like(d.data))
-        return tuple(grads)
+        saved_state = _rng_state()
+        try:
+            # Replay the segment with the same random draws as the first pass.
+            _restore_rng(self.rng_state)
+            # Mark the replay so external effects are not produced a second
+            # time: registered events return their recorded result (and get a
+            # replay entry); unregistered ones raise before any effect.
+            # Prefer the log active *at backward time* (a reopened durable
+            # log must absorb the replay); fall back to the forward-time log.
+            with _replay_scope(current_log() if current_log() is not None else self.event_log):
+                detached = [
+                    Tensor(p.data.copy(), requires_grad=p.requires_grad) for p in self.parents
+                ]
+                out = self.fn(*detached)
+                if not isinstance(out, Tensor) or not out.requires_grad:
+                    raise RuntimeError(
+                        "checkpointed function must return a single Tensor that requires grad"
+                    )
+                out.backward(grad_out)
+                grads = []
+                for d in detached:
+                    grads.append(d.grad.data if d.grad is not None else np.zeros_like(d.data))
+                return tuple(grads)
+        finally:
+            # Replay consumes RNG draws to rebuild the graph, but those draws
+            # are internal; leave the user-visible generator where it was.
+            _restore_rng(saved_state)
 
 
 def checkpoint(fn: Callable[..., Tensor], *args, requires_grad: bool | None = None) -> Tensor:
     """Run fn(*args) saving only inputs; recompute internals in backward.
 
-    fn must be a pure function of its tensor arguments (plus any closed-over
-    parameters) and return a single Tensor.
+    fn should be a pure function of its tensor arguments (plus any
+    closed-over parameters) and return a single Tensor.  If it needs an
+    external effect (remote fetch, counter, file/network write), register it
+    with ``autodiff.events.record_external_event`` instead of performing it
+    directly -- raw external operations inside a recomputing segment raise
+    ``ReplayExternalEventError`` before they can duplicate an effect.
 
     Staleness (in-place modification) is checked for the tensor *arguments*;
     closed-over tensors still receive gradients during recomputation but are
@@ -84,7 +107,8 @@ def checkpoint(fn: Callable[..., Tensor], *args, requires_grad: bool | None = No
     else:
         requires = _grad_enabled() and requires_grad
     versions = [(weakref.ref(t), t._version) for t in _ALL_TENSORS if t.requires_grad]
-    node = _CheckpointFn(fn, rng_state, versions)
+    event_log = current_log()
+    node = _CheckpointFn(fn, rng_state, versions, event_log)
     node.parents = args
     node.input_versions = [a._version for a in args]
     return Tensor(out.data.copy(), requires_grad=requires, grad_fn=node if requires else None)
