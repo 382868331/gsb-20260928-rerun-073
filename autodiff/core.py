@@ -22,9 +22,8 @@ _GRAD_STACK: list[bool] = []
 _ALL_TENSORS: weakref.WeakSet = weakref.WeakSet()
 
 # Process-level RNG used by random ops (``randn``/``rand`` without an explicit
-# ``seed``).  Checkpointing snapshots and restores this generator's state so
-# recomputation reproduces the exact draws of the original forward pass
-# without advancing the generator a second time (no duplicated side effects).
+# ``seed``).  Checkpoint records each draw as an internal event, so recomputation
+# reuses recorded samples and does not advance the generator again.
 _GLOBAL_RNG = np.random.default_rng()
 
 
@@ -40,6 +39,16 @@ def _rng_state() -> dict:
 
 def _restore_rng(state: dict) -> None:
     _GLOBAL_RNG.bit_generator.state = state
+
+
+def get_rng_state() -> dict:
+    """Return a JSON-compatible snapshot of the global random generator."""
+    return _rng_state()
+
+
+def set_rng_state(state: dict) -> None:
+    """Restore a snapshot returned by :func:`get_rng_state`."""
+    _restore_rng(state)
 
 
 @contextmanager
@@ -315,13 +324,29 @@ def ones_like(t: Tensor) -> Tensor:
 
 
 def randn(*shape, seed: int | None = None, requires_grad: bool = False) -> Tensor:
-    rng = np.random.default_rng(seed) if seed is not None else _GLOBAL_RNG
-    return Tensor(rng.standard_normal(_shape(shape)), requires_grad=requires_grad)
+    shape_tuple = _shape(shape)
+    if seed is not None:
+        value = np.random.default_rng(seed).standard_normal(shape_tuple)
+    else:
+        from .events import _random_event
+        draw = lambda: _GLOBAL_RNG.standard_normal(shape_tuple)
+        value = _random_event(
+            "internal_random", f"randn:{','.join(map(str, shape_tuple))}", shape_tuple, draw
+        )
+    return Tensor(value, requires_grad=requires_grad)
 
 
 def rand(*shape, seed: int | None = None, requires_grad: bool = False) -> Tensor:
-    rng = np.random.default_rng(seed) if seed is not None else _GLOBAL_RNG
-    return Tensor(rng.uniform(0.0, 1.0, _shape(shape)), requires_grad=requires_grad)
+    shape_tuple = _shape(shape)
+    if seed is not None:
+        value = np.random.default_rng(seed).uniform(0.0, 1.0, shape_tuple)
+    else:
+        from .events import _random_event
+        draw = lambda: _GLOBAL_RNG.uniform(0.0, 1.0, shape_tuple)
+        value = _random_event(
+            "internal_random", f"rand:{','.join(map(str, shape_tuple))}", shape_tuple, draw
+        )
+    return Tensor(value, requires_grad=requires_grad)
 
 
 def _shape(shape: Iterable) -> tuple[int, ...]:

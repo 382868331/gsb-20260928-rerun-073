@@ -77,8 +77,8 @@ class Sigmoid(Module):
 class Dropout(Module):
     """Inverted dropout; draws from the global RNG (seed with manual_seed).
 
-    Inside checkpoint segments the mask is re-drawn identically during
-    recomputation because the RNG state is restored.
+    Inside checkpoint segments the mask is an internal recorded event and is
+    replayed during recomputation without advancing the global RNG again.
     """
 
     def __init__(self, p: float = 0.5):

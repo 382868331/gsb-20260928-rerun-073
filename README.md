@@ -78,9 +78,12 @@ python -m pytest -q
 切成若干重算区间。短序列直接保留全部状态即可，两者损失与梯度完全一致
 （`tests/test_checkpoint.py` 对照验证）。
 
-- **无副作用重放**：随机算子（`randn`/`rand`/`nn.Dropout`，用 `manual_seed` 播种）
-  走全局 RNG；段边界保存 RNG 状态，重算前恢复，因此重放取样与本次前向**完全相同**，
-  且不会第二次推进生成器——重算没有外部可见副作用。
+- **内部随机事件**：`randn`/`rand`/`nn.Dropout`（用 `manual_seed` 播种）在前向时把抽样
+  记录为区间内部事件；反向重算只读取记录值，因此掩码完全相同，且全局 RNG 只推进一次。
+- **用户可见外部事件**：请求外部服务、写队列、扣费、读取外部可变数据等操作必须通过
+  `external_event(event_id, apply, replay)` 执行。`apply` 只在用户可见前向执行一次并返回
+  JSON 可保存的结果；`replay(payload)` 必须是纯函数，在反向重算或进程重开时重建张量。
+  无法提供纯 `replay` 的操作会在产生效果前抛出 `UnsupportedExternalEventError`。
 - **梯度累计**：共享参数、多分支汇合的梯度与全保留图一致；闭包捕获的参数在
   重算时照常累计 `.grad`。
 - **失效检测**：checkpoint 记录前向时所有存活张量的版本，前向后任何被引用的
@@ -93,6 +96,24 @@ python -m pytest -q
 
 `Module.state_dict()` / `load_state_dict()` 以 numpy 数组快照/恢复参数；恢复通过
 `.data` 赋值递增版本号，加载前构建的旧图自动失效。
+
+训练中的外部事件使用 `TrainingEventLog(path)` 持久化为追加式 JSONL：
+
+```python
+log = ad.TrainingEventLog("checkpoints/events.jsonl")
+with log.use():
+    batch = ad.external_event(
+        f"batch/{step}",
+        lambda: api.fetch_next_batch(),  # 用户可见，只执行一次
+        lambda payload: ad.tensor(payload),  # 重算/重开时的纯重建
+    )
+    loss = ad.checkpoint(model_loss, batch)
+    loss.backward()
+```
+
+重新打开同一个日志后，已确认的事件 ID 不会再次执行 `apply`，而是从记录恢复。日志只追加、
+不重写；训练失败或优化器回滚不能删除已经实际发生的事件记录。相同 ID 若使用不同 payload
+重新提交，会抛出 `EventExistsError`。
 
 ## 正确性验证
 

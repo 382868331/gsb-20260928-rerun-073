@@ -214,3 +214,109 @@ def test_checkpoint_rejects_non_tensor_output():
     x = tensor([1.0], requires_grad=True)
     with pytest.raises(TypeError):
         checkpoint(lambda t: 3.14, x)
+
+
+def test_external_event_runs_once_and_replays_on_each_recompute():
+    x = tensor([[1.0, 2.0]], requires_grad=True)
+    effects = []
+
+    def apply():
+        effects.append("submitted")
+        return [3.0, 4.0]
+
+    def replay(payload):
+        return tensor(payload, requires_grad=True)
+
+    loss = checkpoint(lambda t: (t * ad.external_event("batch-1", apply, replay)).sum(), x)
+    loss.backward()
+    loss.backward()
+
+    assert effects == ["submitted"]
+    assert_close(x.grad.data, np.array([[6.0, 8.0]]))
+
+
+def test_unsupported_external_event_is_rejected_before_effect():
+    effects = []
+    with pytest.raises(ad.UnsupportedExternalEventError, match="pure replay"):
+        ad.external_event("batch-x", lambda: effects.append("effect"))
+    assert effects == []
+
+
+def test_durable_event_is_not_submitted_again_after_reopen(tmp_path):
+    log_path = tmp_path / "events.jsonl"
+    effects = []
+
+    def apply():
+        effects.append("submitted")
+        return [2.0, 5.0]
+
+    def replay(payload):
+        return tensor(payload, requires_grad=True)
+
+    x = tensor([[1.0, 1.0]], requires_grad=True)
+    log = ad.TrainingEventLog(log_path)
+    with log.use():
+        loss = checkpoint(lambda t: (t * ad.external_event("durable-batch", apply, replay)).sum(), x)
+        loss.backward()
+
+    reopened = ad.TrainingEventLog(log_path)
+    with reopened.use():
+        value = ad.external_event("durable-batch", apply, replay)
+        value.sum().backward()
+
+    assert effects == ["submitted"]
+    assert len(reopened) == 1
+    assert reopened.get("durable-batch")["kind"] == "user"
+
+    reopened.rollback("simulated optimizer failure")
+    assert ad.TrainingEventLog(log_path).get("durable-batch")["payload"] == [2.0, 5.0]
+
+
+def test_durable_log_rejects_conflicting_resubmission(tmp_path):
+    log = ad.TrainingEventLog(tmp_path / "events.jsonl")
+    log.record("batch", {"value": 1})
+    with pytest.raises(ad.EventExistsError, match="already committed"):
+        log.record("batch", {"value": 2})
+
+
+def test_durable_log_preserves_latest_random_state(tmp_path):
+    log_path = tmp_path / "events.jsonl"
+    manual_seed(100)
+    ad.rand(2)
+    log = ad.TrainingEventLog(log_path)
+    log.record_rng_state()
+    expected = ad.rand(2).data
+
+    manual_seed(999)
+    reopened = ad.TrainingEventLog(log_path)
+    reopened.restore_rng_state()
+    assert_close(ad.rand(2).data, expected)
+
+    manual_seed(101)
+    reopened.record_rng_state()
+    expected2 = ad.rand(2).data
+    reopened = ad.TrainingEventLog(log_path)
+    reopened.restore_rng_state()
+    assert_close(ad.rand(2).data, expected2)
+    assert [e["id"] for e in reopened.user_events()] == []
+
+
+def test_random_and_external_events_mix_with_shared_parameter():
+    manual_seed(31)
+    expected_mask = np.random.default_rng(31).uniform(size=3)
+    w = tensor(np.eye(3), requires_grad=True)
+    x = tensor(np.ones((1, 3)), requires_grad=True)
+    external = ad.external_event("mix", lambda: [1.0, 2.0, 3.0], lambda p: tensor(p))
+
+    def segment(t):
+        left = t @ w
+        right = external @ w
+        return (left * ad.rand(3) + right).sum()
+
+    loss = checkpoint(segment, x)
+    state_after_forward = _rng_state()
+    loss.backward()
+    loss.backward()
+    assert _rng_state() == state_after_forward
+    expected_grad = (expected_mask[None, :] + np.array([1.0, 2.0, 3.0])[:, None]) * 2
+    assert_close(w.grad.data, expected_grad)
