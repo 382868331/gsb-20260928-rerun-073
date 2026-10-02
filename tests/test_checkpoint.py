@@ -320,3 +320,151 @@ def test_random_and_external_events_mix_with_shared_parameter():
     assert _rng_state() == state_after_forward
     expected_grad = (expected_mask[None, :] + np.array([1.0, 2.0, 3.0])[:, None]) * 2
     assert_close(w.grad.data, expected_grad)
+
+
+def test_training_step_tracks_occurred_unconfirmed_and_skipped_effects(tmp_path):
+    log = ad.TrainingEventLog(tmp_path / "step.jsonl")
+    calls = []
+
+    def reserve():
+        calls.append("reserve")
+        return {"reservation": 7}
+
+    def uncertain_submit():
+        calls.append("submit")
+        raise ad.ExternalEffectUncertain("timeout after write")
+
+    with pytest.raises(ad.ExternalEffectUncertain):
+        with log.step(42, ["reserve", "submit", "publish"]):
+            assert ad.external_event("reserve", reserve) == {"reservation": 7}
+            ad.external_event("submit", uncertain_submit)
+
+    assert calls == ["reserve", "submit"]
+    assert log.effect_statuses(42) == {
+        "reserve": "occurred",
+        "submit": "unconfirmed",
+        "publish": "not_executed",
+    }
+    failure = log.step_failure(42)
+    assert failure is not None and "timeout after write" in failure["reason"]
+    assert {"reserve", "submit", "publish"} == set(log.effects(42))
+
+
+def test_training_step_verifies_and_resumes_after_reopen(tmp_path):
+    path = tmp_path / "step.jsonl"
+    log = ad.TrainingEventLog(path)
+    calls = []
+
+    with pytest.raises(RuntimeError):
+        with log.begin_step(9, ["charge", "email"]):
+            assert ad.external_event("charge", lambda: (calls.append("charge"), {"amount": 1})[1])
+            def email():
+                calls.append("email")
+                raise RuntimeError("network reset")
+            ad.external_event("email", email)
+
+    reopened = ad.TrainingEventLog(path)
+    reopened.verify_effect(9, "email", False, note="support checked outbound log")
+    resume = reopened.resume_step(9)
+    calls_2 = []
+    sent = resume.run_effect("email", lambda: (calls_2.append("email"), {"sent": True})[1])
+    assert sent == {"sent": True}
+    assert calls == ["charge", "email"] and calls_2 == ["email"]
+
+    model = nn.Linear(2, 1, seed=5)
+    x = tensor([[1.0, 2.0]], requires_grad=True)
+    opt = optim.SGD(model.parameters(), lr=0.25)
+    opt.zero_grad()
+    loss = (model(x) ** 2).sum()
+    loss.backward()
+    before = [p.data.copy() for p in model.parameters()]
+    grads = [p.grad.data.copy() for p in model.parameters()]
+    record = resume.complete(model, optimizer=opt, loss=loss)
+    after = [p.data.copy() for p in model.parameters()]
+    completion = record["payload"]["completion"]
+    assert record["payload"]["state"] == "complete"
+    assert completion["model_before_optimizer"]["parameters"] == [a.tolist() for a in before]
+    assert completion["model_before_optimizer"]["gradients"] == [a.tolist() for a in grads]
+    assert completion["model_after_optimizer"]["parameters"] == [a.tolist() for a in after]
+    assert completion["effect_digest"]
+
+
+def test_training_step_verification_is_idempotent_and_never_repeats_occurred(tmp_path):
+    log = ad.TrainingEventLog(tmp_path / "step.jsonl")
+    calls = []
+    with pytest.raises(RuntimeError):
+        with log.begin_step(1, ["a", "b"]):
+            ad.external_event("a", lambda: (calls.append("a"), 10)[1])
+            def fail_b():
+                calls.append("b")
+                raise RuntimeError("maybe")
+            ad.external_event("b", fail_b)
+
+    log.verify_effect(1, "b", True, {"id": 99}, note="found receipt")
+    log.verify_effect(1, "b", True, {"id": 99}, note="repeat user check")
+    with pytest.raises(ad.EventExistsError):
+        log.verify_effect(1, "b", False)
+    resumed = log.resume_step(1)
+    value = resumed.run_effect("b", lambda: (_ for _ in ()).throw(AssertionError("must not run")))
+    assert value == {"id": 99}
+    assert calls == ["a", "b"]
+    verifications = [e for e in log.audit_events(1) if e["kind"] == "training_verification"]
+    assert [e["payload"]["note"] for e in verifications] == ["found receipt", "repeat user check"]
+
+
+def test_training_step_rejects_completion_without_gradients_or_open_effects(tmp_path):
+    log = ad.TrainingEventLog(tmp_path / "step.jsonl")
+    model = nn.Linear(1, 1, seed=2)
+    with log.begin_step(3, ["a"]) as step:
+        step.run_effect("a", lambda: 1)
+        with pytest.raises(ad.IncompleteTrainingStepError, match="gradients"):
+            step.complete(model)
+
+    reopened = ad.TrainingEventLog(log.path)
+    assert reopened.step_state(3) == "failed"
+    assert not reopened.is_step_complete(3)
+
+
+def test_training_step_random_multi_backward_and_reopen_resume(tmp_path):
+    path = tmp_path / "step.jsonl"
+    log = ad.TrainingEventLog(path)
+    ad.manual_seed(77)
+    model = nn.Sequential(nn.Linear(3, 3, seed=10), nn.ReLU(), nn.Linear(3, 1, seed=11))
+    x = tensor(np.ones((2, 3)), requires_grad=True)
+    y = tensor(np.ones((2, 1)))
+
+    with pytest.raises(ad.ExternalEffectUncertain):
+        with log.begin_step(7, ["batch", "commit"]):
+            batch = ad.external_event("batch", lambda: np.arange(6).reshape(2, 3) / 5, lambda p: tensor(p))
+            def maybe_commit():
+                raise ad.ExternalEffectUncertain("request id unknown")
+            ad.external_event("commit", maybe_commit)
+
+    reopened = ad.TrainingEventLog(path)
+    reopened.verify_effect(7, "commit", False, note="request id absent")
+    with reopened.resume_step(7) as step:
+        batch = step.run_effect("batch", replay=lambda p: tensor(p))
+        mask = ad.rand(2, 3)
+        pred = model((x + batch) * mask)
+        loss = nn.mse_loss(pred, y)
+        loss.backward()
+        first = [p.grad.data.copy() for p in model.parameters()]
+        loss.backward()
+        doubled = [p.grad.data.copy() for p in model.parameters()]
+        for g0, g1 in zip(first, doubled):
+            assert_close(g1, 2 * g0)
+        commit_calls = []
+        assert step.run_effect("commit", lambda: (commit_calls.append("commit"), "ok")[1]) == "ok"
+        step.complete(model, optimizer=optim.SGD(model.parameters(), lr=0.01), loss=loss)
+
+    final = ad.TrainingEventLog(path)
+    assert final.is_step_complete(7)
+    assert final.effect_statuses(7) == {"batch": "occurred", "commit": "occurred"}
+    audit_kinds = {e["kind"] for e in final.audit_events(7)}
+    assert {"training_step", "training_effect", "training_verification"} <= audit_kinds
+    step_states = [
+        e["payload"]["state"]
+        for e in final.audit_events(7)
+        if e["kind"] == "training_step"
+    ]
+    assert step_states == ["started", "failed", "resumable", "complete"]

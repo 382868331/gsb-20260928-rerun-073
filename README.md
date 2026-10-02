@@ -115,6 +115,34 @@ with log.use():
 不重写；训练失败或优化器回滚不能删除已经实际发生的事件记录。相同 ID 若使用不同 payload
 重新提交，会抛出 `EventExistsError`。
 
+### 单项训练步骤的外部效果状态机
+
+一组相互依赖的外部效果必须先在同一个步骤中声明，并按声明顺序执行：
+
+```python
+try:
+    with log.begin_step(step, ["reserve", "submit", "publish"]) as tx:
+        reservation = tx.run_effect("reserve", api.reserve)
+        submission = tx.run_effect("submit", lambda: api.submit(reservation))
+        loss.backward()
+        tx.complete(model, optimizer=opt, loss=loss)
+except Exception as exc:
+    tx.fail(exc)
+```
+
+每个声明效果都会落入三种可审计状态之一：
+
+- `occurred`：已经确认发生，并保存可用于重建的 JSON payload；
+- `unconfirmed`：请求可能发出但结果未知，后续效果保持 `not_executed`；
+- `not_executed`：因依赖项未确认或步骤中断而没有执行。
+
+进程重开后可补充核实结论，再从明确位置继续。重复核实同一个“已发生”结论只会追加核实记录，
+不会再次执行效果；只有核实为“未发生”才允许重新申请。`complete()` 只在同一轮训练的全部
+外部效果均已确认、所有必需梯度已经计算后才可调用。完成记录绑定效果 payload 摘要、优化前
+模型与梯度、优化后模型、loss 和 RNG 状态；因此“部分效果已发生但计算未完成”只会保存为
+失败/待续步骤，不会伪装成普通完成步骤。原失败原因与每次用户核实记录都作为追加 JSONL 事件
+保留，可通过 `log.step_failure(step)` 和 `log.audit_events(step)` 追查。
+
 ## 正确性验证
 
 `tests/` 使用**中心差分数值梯度**独立核对所有核心算子与组合图
