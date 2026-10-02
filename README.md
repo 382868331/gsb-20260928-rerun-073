@@ -115,6 +115,37 @@ with log.use():
 不重写；训练失败或优化器回滚不能删除已经实际发生的事件记录。相同 ID 若使用不同 payload
 重新提交，会抛出 `EventExistsError`。
 
+## 步骤内的多项依赖效果
+
+一个训练步骤常包含多项相互依赖的外部效果（先确认结果再决定是否提交下一项）。
+`log.step(step_id, plan=[...])` 把这些效果归入同一轮训练：
+
+```python
+with log.step(f"step/{n}", plan=["fetch", "confirm", "submit"]) as step:
+    if step.completed:
+        continue  # 该轮已完成，跳过
+    batch = step.effect("fetch", api.fetch, lambda p: ad.tensor(p))
+    ok = step.effect("confirm", api.confirm, lambda p: bool(p))
+    if ok:
+        step.effect("submit", api.submit, lambda p: p)
+    loss = softmax_ce_loss(model(batch), labels)
+    loss.backward()
+    opt.step()
+```
+
+- **失败分类**：某一项 `apply` 抛异常时抛出 `StepEffectError`，其 `report` 明确区分
+  `applied`（已发生）/ `unconfirmed`（结果未知）/ `pending`（未执行）；已发生的效果
+  是持久事实，**不会**通过回退整个步骤被抹掉。步骤体异常退出或仍有未确认项时，只记录
+  `interrupted` 步骤，绝不写成普通完成步骤。
+- **用户核实**：续跑遇到未确认项会抛 `UnconfirmedEffectError`。调用
+  `log.verify(attempt_id, occurred, payload=..., note=...)` 追加核实结论后从明确位置
+  接续：核实为已发生则按结论 payload 重放；核实为未发生才允许重新申请执行（记为关联的
+  新一次 attempt）。重复提交相同核实是幂等的，不会触发重复效果；冲突的核实抛
+  `EventExistsError`。
+- **一致性**：步骤的梯度、模型状态与事件记录属于同一轮训练；已完成的步骤拒绝再次执行
+  效果（`EventExistsError`）。失败依据（异常记录）与用户核实记录都持久保存在 JSONL
+  中，可事后追查。`log.step_report(step_id, plan)` 可随时查询当前分类。
+
 ## 正确性验证
 
 `tests/` 使用**中心差分数值梯度**独立核对所有核心算子与组合图

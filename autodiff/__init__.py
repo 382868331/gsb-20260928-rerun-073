@@ -6,7 +6,10 @@ from .core import (
 from .checkpoint import checkpoint, checkpoint_sequential
 from .events import (
     EventExistsError,
+    StepEffectError,
+    TrainingStep,
     TrainingEventLog,
+    UnconfirmedEffectError,
     UnsupportedExternalEventError,
     EventLog,
     event,
@@ -26,7 +29,8 @@ __all__ = [
     "get_rng_state", "set_rng_state",
     "manual_seed", "checkpoint", "checkpoint_sequential",
     "TrainingEventLog", "EventLog", "EventExistsError",
-    "UnsupportedExternalEventError", "external_event", "event",
+    "UnsupportedExternalEventError", "StepEffectError", "TrainingStep",
+    "UnconfirmedEffectError", "external_event", "event",
     "broadcast_shapes", "no_grad", "nn", "optim",
     "add", "sub", "mul", "div", "neg", "pow_", "matmul", "sum", "mean",
     "reshape", "transpose",
