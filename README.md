@@ -143,6 +143,38 @@ except Exception as exc:
 失败/待续步骤，不会伪装成普通完成步骤。原失败原因与每次用户核实记录都作为追加 JSONL 事件
 保留，可通过 `log.step_failure(step)` 和 `log.audit_events(step)` 追查。
 
+### 外部效果的补偿安排
+
+已发生的外部效果不随检查点回退而消失。放弃某条训练分支时，可以为每个
+`occurred` 效果登记补偿安排，原效果记录永远保持 `occurred`，不会被改回未执行：
+
+```python
+log.decide_compensation(step, "submit", "compensate", quantity=2.0)  # 申请抵消（限定范围）
+log.decide_compensation(step, "reserve", "retain")                   # 保留登记
+log.decide_compensation(step, "publish", "pending")                  # 仍等待核实
+```
+
+- `run_compensation(step, name, apply, replay, quantity=...)` 执行抵消效果，本身也会落入
+  `occurred / unconfirmed / not_occurred`；已确认的补偿再次申请只会重放记录，数量按剩余
+  允许范围截断，重复申请不会双重抵消。
+- `verify_compensation(step, name, occurred, ...)` 处理迟到的补偿回执；重复确认只追加审计
+  记录，已补偿数量不增加。原效果在部分补偿后被重新核实，也不影响补偿进度。
+- 没有 `occurred` 证据的效果不能登记或执行补偿（`UnconfirmedEffectError`）。
+- `log.compensation(step, name)` 返回目标效果、决定、允许范围与已补偿数量；
+  `log.continuation(step)` 按声明顺序报告哪些相互依赖的效果可以继续、哪些仍与外部
+  事实冲突（部分补偿、未决定、未确认都算冲突并阻断后续效果）。
+
+### 从检查点建立训练分支
+
+```python
+branch = log.create_branch("retry", from_step=step, path="checkpoints/branch.jsonl")
+branch.restore_branch(model, optimizer=opt)  # 只恢复参数/清空梯度/重置优化器状态
+```
+
+只能从 `complete` 的检查点建分支。新分支继承真实发生的外部事实（`occurred` 的原效果
+与已确认补偿），但不继承另一分支尚未获确认的补偿决定。恢复只写参数数据、清空梯度并
+重置优化器动量/矩估计，不执行任何参数更新，因此处理补偿不会重复应用一次更新。
+
 ## 正确性验证
 
 `tests/` 使用**中心差分数值梯度**独立核对所有核心算子与组合图

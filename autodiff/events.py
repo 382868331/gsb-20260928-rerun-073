@@ -51,6 +51,10 @@ class IncompleteTrainingStepError(TrainingStepError):
     """Raised when completion is requested before computation is finished."""
 
 
+class CompensationError(TrainingStepError):
+    """Raised when a compensation arrangement is inconsistent with the facts."""
+
+
 def _json_default(value: Any):
     import numpy as np
     if isinstance(value, np.ndarray):
@@ -245,6 +249,370 @@ class TrainingEventLog:
         step_key = TrainingStep._step_key(step_id)
         prefix = f"{step_key}:"
         return tuple(deepcopy(e) for e in self._history if e["id"] == step_key or e["id"].startswith(prefix))
+
+    # ----------------------------------------------------- compensation
+    @staticmethod
+    def _comp_key(step_id: str | int, effect_name: str) -> str:
+        return f"{TrainingStep._effect_key(step_id, effect_name)}:compensation"
+
+    def _compensation_record(self, step_id: str | int, effect_name: str) -> dict[str, Any]:
+        key = self._comp_key(step_id, effect_name)
+        if key not in self._events:
+            raise KeyError(
+                f"no compensation arrangement for effect {effect_name!r} of step {step_id!r}; "
+                "call decide_compensation first"
+            )
+        return deepcopy(self._events[key]["payload"])
+
+    def _write_compensation(self, record: dict[str, Any]) -> dict[str, Any]:
+        return self.append(
+            self._comp_key(record["step"], record["name"]), record,
+            kind="compensation", phase="training", overwrite=True,
+        )
+
+    def _append_compensation_audit(self, record: dict[str, Any], action: str, note: str, extra: dict[str, Any]) -> None:
+        key = self._comp_key(record["step"], record["name"])
+        sequence = [e for e in self._history if e["id"].startswith(f"{key}:{action}:")]
+        payload = {
+            "step": record["step"],
+            "name": record["name"],
+            "decision": record["decision"],
+            "status": record["status"],
+            "quantity_allowed": record["quantity_allowed"],
+            "quantity_compensated": record["quantity_compensated"],
+            "note": note,
+        }
+        payload.update(extra)
+        self.append(
+            f"{key}:{action}:{len(sequence)}", payload,
+            kind=f"compensation_{action}", phase="training",
+        )
+
+    def decide_compensation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        decision: str,
+        *,
+        quantity: float | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Record the human arrangement for an external fact of a step.
+
+        decision is one of "retain" (keep the registration as-is),
+        "compensate" (apply an offsetting effect, up to quantity), or
+        "pending" (still awaiting verification). The original effect
+        record is never rewritten: an occurred effect stays occurred.
+        """
+        step_id = str(step_id)
+        name = str(effect_name)
+        if decision not in ("retain", "compensate", "pending"):
+            raise ValueError(f"unknown compensation decision {decision!r}")
+        effect = self.effect(step_id, name)
+        if decision != "pending" and effect["status"] != "occurred":
+            raise UnconfirmedEffectError(
+                f"effect {name!r} of step {step_id!r} is {effect['status']}; "
+                "only effects confirmed as occurred can be retained or compensated"
+            )
+        key = self._comp_key(step_id, name)
+        if key in self._events:
+            record = deepcopy(self._events[key]["payload"])
+            if record["status"] == "occurred" and record["decision"] != decision:
+                raise EventExistsError(
+                    f"compensation for effect {name!r} already executed; the decision is locked"
+                )
+            record["decision"] = decision
+            if quantity is not None:
+                if float(quantity) < record["quantity_compensated"]:
+                    raise CompensationError(
+                        "allowed quantity cannot be below the already compensated amount"
+                    )
+                record["quantity_allowed"] = float(quantity)
+        else:
+            record = {
+                "step": step_id,
+                "name": name,
+                "target": TrainingStep._effect_key(step_id, name),
+                "decision": decision,
+                "status": "not_started",
+                "quantity_allowed": 1.0 if quantity is None else float(quantity),
+                "quantity_compensated": 0.0,
+                "payload": None,
+                "reason": None,
+            }
+        self._write_compensation(record)
+        self._append_compensation_audit(record, "decision", note, {})
+        return deepcopy(record)
+
+    def compensation(self, step_id: str | int, effect_name: str) -> dict[str, Any]:
+        """Current compensation record: target, decision, scope and progress."""
+        return self._compensation_record(step_id, effect_name)
+
+    def compensations(self, step_id: str | int) -> dict[str, dict[str, Any]]:
+        prefix = f"{TrainingStep._step_key(step_id)}:effect:"
+        out: dict[str, dict[str, Any]] = {}
+        for key, event in self._events.items():
+            if event.get("kind") == "compensation" and key.startswith(prefix):
+                out[event["payload"]["name"]] = deepcopy(event["payload"])
+        return out
+
+    def run_compensation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        apply: Callable[[], Any] | None = None,
+        replay: Callable[[Any], Any] | None = None,
+        *,
+        quantity: float | None = None,
+    ) -> Any:
+        """Execute the compensating effect once, within the allowed scope.
+
+        Idempotent: an already confirmed compensation is replayed, never
+        re-applied; quantities are clamped to the remaining allowed scope so
+        duplicate requests cannot double-offset the original fact.
+        """
+        step_id = str(step_id)
+        name = str(effect_name)
+        record = self._compensation_record(step_id, name)
+        if record["decision"] != "compensate":
+            raise CompensationError(
+                f"effect {name!r} is decided as {record['decision']!r}, not 'compensate'"
+            )
+        effect_status = self.effect(step_id, name)["status"]
+        if effect_status != "occurred":
+            raise UnconfirmedEffectError(
+                f"effect {name!r} of step {step_id!r} is {effect_status}; without evidence "
+                "that the original effect occurred no compensation may execute"
+            )
+        remaining = record["quantity_allowed"] - record["quantity_compensated"]
+        if record["status"] == "occurred" and remaining <= 0:
+            return replay(record["payload"]) if replay is not None else deepcopy(record["payload"])
+        if record["status"] == "unconfirmed":
+            raise UnconfirmedEffectError(
+                f"compensation for effect {name!r} is unconfirmed; "
+                "call verify_compensation with the late receipt before retrying"
+            )
+        if remaining <= 0:
+            if replay is not None and record["payload"] is not None:
+                return replay(record["payload"])
+            return deepcopy(record["payload"])
+        if apply is None:
+            raise ValueError("apply is required for a compensation that has not completed")
+        qty = remaining if quantity is None else min(float(quantity), remaining)
+        try:
+            payload = apply()
+        except ExternalEffectUncertain as exc:
+            record["status"] = "unconfirmed"
+            record["reason"] = str(exc)
+            self._write_compensation(record)
+            raise
+        except ExternalEffectNotExecuted as exc:
+            record["status"] = "not_occurred"
+            record["reason"] = str(exc)
+            self._write_compensation(record)
+            raise
+        except Exception as exc:
+            record["status"] = "unconfirmed"
+            record["reason"] = repr(exc)
+            self._write_compensation(record)
+            raise
+        record["status"] = "occurred"
+        record["payload"] = payload
+        record["reason"] = None
+        record["quantity_compensated"] += qty
+        self._write_compensation(record)
+        self._append_compensation_audit(record, "receipt", "", {"quantity": qty, "payload": deepcopy(payload)})
+        return replay(payload) if replay is not None else deepcopy(payload)
+
+    def verify_compensation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        occurred: bool,
+        payload: Any = None,
+        *,
+        quantity: float | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Resolve an unconfirmed compensation from a (possibly late) receipt.
+
+        Confirming an already confirmed compensation only appends an audit
+        record; the compensated quantity never increases twice.
+        """
+        step_id = str(step_id)
+        name = str(effect_name)
+        record = self._compensation_record(step_id, name)
+        if record["status"] == "occurred":
+            if not occurred:
+                raise EventExistsError(
+                    f"compensation for effect {name!r} was already confirmed; it cannot be revoked"
+                )
+            self._append_compensation_audit(record, "verification", note, {"duplicate": True})
+            return deepcopy(record)
+        if record["status"] != "unconfirmed":
+            raise UnconfirmedEffectError(
+                f"compensation for effect {name!r} is {record['status']}; nothing to verify"
+            )
+        if occurred:
+            remaining = record["quantity_allowed"] - record["quantity_compensated"]
+            qty = remaining if quantity is None else min(float(quantity), remaining)
+            record["status"] = "occurred"
+            record["payload"] = payload
+            record["reason"] = None
+            record["quantity_compensated"] += qty
+        else:
+            record["status"] = "not_occurred"
+            record["payload"] = None
+        self._write_compensation(record)
+        self._append_compensation_audit(record, "verification", note, {"occurred": bool(occurred)})
+        return deepcopy(record)
+
+    # ----------------------------------------------------- resolution
+    def effect_resolution(self, step_id: str | int, effect_name: str) -> dict[str, Any]:
+        """Whether one effect is reconciled with the external facts."""
+        step_id = str(step_id)
+        name = str(effect_name)
+        status = self.effect_statuses(step_id).get(name)
+        if status is None:
+            raise KeyError(f"effect {name!r} is not declared for step {step_id!r}")
+        if status in ("not_occurred", "not_executed"):
+            return {"effect": name, "status": status, "resolution": "resolved", "detail": status}
+        if status == "unconfirmed":
+            return {"effect": name, "status": status, "resolution": "conflict", "detail": "unconfirmed"}
+        key = self._comp_key(step_id, name)
+        record = deepcopy(self._events[key]["payload"]) if key in self._events else None
+        if record is None or record["decision"] == "pending":
+            return {"effect": name, "status": status, "resolution": "conflict", "detail": "awaiting_decision"}
+        if record["decision"] == "retain":
+            return {"effect": name, "status": status, "resolution": "resolved", "detail": "retained"}
+        if record["status"] == "unconfirmed":
+            detail = "compensation_unconfirmed"
+        elif record["quantity_compensated"] >= record["quantity_allowed"]:
+            detail = "compensated"
+        elif record["quantity_compensated"] > 0:
+            detail = "partially_compensated"
+        else:
+            detail = "compensation_pending"
+        resolution = "resolved" if detail == "compensated" else "conflict"
+        return {"effect": name, "status": status, "resolution": resolution, "detail": detail}
+
+    def continuation(self, step_id: str | int) -> dict[str, Any]:
+        """Which declared effects may proceed and which still conflict.
+
+        Effects are mutually dependent in declaration order: an effect is
+        continuable only when it and every earlier effect are resolved.
+        """
+        step_id = str(step_id)
+        names = list(self.get(TrainingStep._step_key(step_id))["payload"]["effects"])
+        effects: dict[str, dict[str, Any]] = {}
+        continuable: list[str] = []
+        conflicting: list[str] = []
+        blocked = False
+        for name in names:
+            info = self.effect_resolution(step_id, name)
+            ok = info["resolution"] == "resolved" and not blocked
+            info["continuable"] = ok
+            effects[name] = info
+            if ok:
+                continuable.append(name)
+            else:
+                conflicting.append(name)
+                blocked = True
+        return {
+            "step": step_id,
+            "effects": effects,
+            "continuable": continuable,
+            "conflicting": conflicting,
+            "step_continuable": not conflicting,
+        }
+
+    # ----------------------------------------------------- branching
+    def create_branch(
+        self,
+        branch_id: str,
+        from_step: str | int,
+        path: str | os.PathLike[str],
+    ) -> "TrainingEventLog":
+        """Fork a new training branch from a completed compute checkpoint.
+
+        The new branch inherits the external facts that really happened
+        (occurred effects and occurred compensations) plus the model and RNG
+        state of the checkpoint. Compensation decisions that are not yet
+        confirmed on this branch are not carried over.
+        """
+        branch_id = str(branch_id)
+        record = self.get(TrainingStep._step_key(from_step))["payload"]
+        if record["state"] != "complete":
+            raise IncompleteTrainingStepError(
+                f"step {from_step!r} is {record['state']}; branches start from confirmed checkpoints"
+            )
+        completion = record["completion"]
+        branch = TrainingEventLog(path)
+        if len(branch):
+            raise EventExistsError(f"branch target {str(path)!r} is not an empty log")
+        branch.append(
+            f"branch:{branch_id}",
+            {
+                "branch": branch_id,
+                "from_step": str(from_step),
+                "source_log": str(self.path),
+                "model": deepcopy(completion["model_after_optimizer"]),
+                "rng_state": deepcopy(completion["rng_state"]),
+                "gradient_digest": completion["gradient_digest"],
+                "loss": completion["loss"],
+            },
+            kind="training_branch", phase="training",
+        )
+        for key, event in self._events.items():
+            kind = event.get("kind")
+            status = event["payload"].get("status") if isinstance(event.get("payload"), dict) else None
+            if kind == "training_effect" and status == "occurred":
+                branch.append(
+                    f"branch:{branch_id}:fact:{key}", deepcopy(event["payload"]),
+                    kind="inherited_effect", phase="training",
+                )
+            elif kind == "compensation" and status == "occurred":
+                branch.append(
+                    f"branch:{branch_id}:fact:{key}", deepcopy(event["payload"]),
+                    kind="inherited_compensation", phase="training",
+                )
+        return branch
+
+    def branch_record(self) -> dict[str, Any]:
+        for event in self._events.values():
+            if event.get("kind") == "training_branch":
+                return deepcopy(event["payload"])
+        raise KeyError("this log is not a branch created by create_branch")
+
+    def inherited_effects(self) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            deepcopy(e["payload"]) for e in self._events.values()
+            if e.get("kind") in ("inherited_effect", "inherited_compensation")
+        )
+
+    def restore_branch(self, model: Any, optimizer: Any | None = None) -> dict[str, Any]:
+        """Load the branch checkpoint into model (and reset optimizer).
+
+        Only parameter data, gradients and optimizer state are touched; no
+        optimizer update is applied, so processing compensation on either
+        branch can never replay a parameter update.
+        """
+        import numpy as np
+        info = self.branch_record()
+        params = list(model.parameters())
+        snapshot = info["model"]["parameters"]
+        if len(params) != len(snapshot):
+            raise ValueError("model parameter count does not match the branch checkpoint")
+        for param, values in zip(params, snapshot):
+            param.data = np.asarray(values, dtype=float)
+            param.grad = None
+        if optimizer is not None:
+            reset = getattr(optimizer, "reset_state", None)
+            if reset is not None:
+                reset()
+        from .core import set_rng_state
+        set_rng_state(info["rng_state"])
+        return info
 
     def _load_unlocked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():

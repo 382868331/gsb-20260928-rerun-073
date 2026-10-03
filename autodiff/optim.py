@@ -19,6 +19,9 @@ class Optimizer:
         for p in self.params:
             p.zero_grad()
 
+    def reset_state(self) -> None:
+        """Drop step-dependent state (momentum, moments, step count)."""
+
     def step(self) -> None:
         raise NotImplementedError
 
@@ -27,6 +30,9 @@ class SGD(Optimizer):
     def __init__(self, params, lr: float = 0.01, momentum: float = 0.0):
         super().__init__(params, lr)
         self.momentum = momentum
+        self._velocity = None
+
+    def reset_state(self) -> None:
         self._velocity = None
 
     def step(self) -> None:
@@ -49,6 +55,11 @@ class Adam(Optimizer):
         super().__init__(params, lr)
         self.beta1, self.beta2 = betas
         self.eps = eps
+        self.t = 0
+        self._m = [np.zeros_like(p.data) for p in self.params]
+        self._v = [np.zeros_like(p.data) for p in self.params]
+
+    def reset_state(self) -> None:
         self.t = 0
         self._m = [np.zeros_like(p.data) for p in self.params]
         self._v = [np.zeros_like(p.data) for p in self.params]
