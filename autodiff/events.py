@@ -51,6 +51,22 @@ class IncompleteTrainingStepError(TrainingStepError):
     """Raised when completion is requested before computation is finished."""
 
 
+class CompensationError(TrainingStepError):
+    """Base class for compensation-arrangement errors."""
+
+
+class NoEffectEvidenceError(CompensationError):
+    """Raised when compensation is requested without proof the effect occurred."""
+
+
+class CompensationLimitError(CompensationError):
+    """Raised when an offset would double-count or exceed the permitted scope."""
+
+
+class CompensationStateError(CompensationError):
+    """Raised when a compensation/decision is used in the wrong state."""
+
+
 def _json_default(value: Any):
     import numpy as np
     if isinstance(value, np.ndarray):
@@ -68,6 +84,19 @@ def _digest(value: Any) -> str:
     return sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _effect_quantity(payload: Any, quantity: Callable[[Any], float] | float | int | None) -> float | None:
+    if quantity is None:
+        return None
+    if callable(quantity):
+        value = quantity(payload)
+    else:
+        value = quantity
+    result = float(value)
+    if result < 0:
+        raise ValueError("external effect quantity must be non-negative")
+    return result
+
+
 def _model_snapshot(model: Any) -> dict[str, Any]:
     params = list(model.parameters())
     import numpy as np
@@ -76,6 +105,46 @@ def _model_snapshot(model: Any) -> dict[str, Any]:
         "parameters": [np.asarray(p.data).tolist() for p in params],
         "gradients": [None if p.grad is None else np.asarray(p.grad.data).tolist() for p in params],
     }
+
+
+def _optimizer_snapshot(optimizer: Any) -> dict[str, Any] | None:
+    if optimizer is None:
+        return None
+    import numpy as np
+    snapshot: dict[str, Any] = {"type": type(optimizer).__name__, "lr": float(optimizer.lr)}
+    if type(optimizer).__name__ == "SGD":
+        snapshot.update({
+            "momentum": float(getattr(optimizer, "momentum", 0.0)),
+            "velocity": [None if v is None else np.asarray(v).tolist() for v in (optimizer._velocity or [])],
+        })
+    elif type(optimizer).__name__ == "Adam":
+        snapshot.update({
+            "betas": [float(optimizer.beta1), float(optimizer.beta2)],
+            "eps": float(optimizer.eps),
+            "t": int(optimizer.t),
+            "m": [np.asarray(v).tolist() for v in optimizer._m],
+            "v": [np.asarray(v).tolist() for v in optimizer._v],
+        })
+    return snapshot
+
+
+def _restore_optimizer(optimizer: Any, snapshot: dict[str, Any] | None) -> None:
+    import numpy as np
+    if snapshot is None:
+        return
+    kind = snapshot.get("type")
+    if kind == "SGD":
+        velocity = snapshot.get("velocity") or []
+        optimizer._velocity = [None if v is None else np.asarray(v, dtype=np.float64) for v in velocity] or None
+        optimizer.momentum = float(snapshot.get("momentum", 0.0))
+    elif kind == "Adam":
+        optimizer.t = int(snapshot.get("t", 0))
+        optimizer._m = [np.asarray(v, dtype=np.float64) for v in snapshot["m"]]
+        optimizer._v = [np.asarray(v, dtype=np.float64) for v in snapshot["v"]]
+        beta1, beta2 = snapshot.get("betas", (0.9, 0.999))
+        optimizer.beta1, optimizer.beta2 = float(beta1), float(beta2)
+        optimizer.eps = float(snapshot.get("eps", 1e-8))
+    optimizer.lr = float(snapshot.get("lr", optimizer.lr))
 
 
 class TrainingEventLog:
@@ -246,6 +315,146 @@ class TrainingEventLog:
         prefix = f"{step_key}:"
         return tuple(deepcopy(e) for e in self._history if e["id"] == step_key or e["id"].startswith(prefix))
 
+    # ----------------------------------------------------- compensation
+    def _decision_events(self, step_id: str | int, effect_name: str) -> list[dict[str, Any]]:
+        prefix = f"{TrainingStep._decision_key(step_id, effect_name)}:"
+        return [e for e in self._events.values() if e.get("kind") == "compensation_decision" and (e["id"] == prefix.rstrip(":") or e["id"].startswith(prefix))]
+
+    def compensation_decisions(self, step_id: str | int, effect_name: str | None = None) -> tuple[dict[str, Any], ...]:
+        """Audit trail (chronological) of human compensation decisions."""
+        step_id = str(step_id)
+        if effect_name is not None:
+            return tuple(deepcopy(e) for e in self._decision_events(step_id, effect_name))
+        return tuple(
+            deepcopy(e) for e in self._history
+            if e.get("kind") == "compensation_decision" and e["payload"].get("step") == step_id
+        )
+
+    def compensation_attempts(self, step_id: str | int, effect_name: str | None = None) -> tuple[dict[str, Any], ...]:
+        """All compensation runs (across every branch) that target an effect."""
+        step_id = str(step_id)
+        seen: dict[str, dict[str, Any]] = {}
+        for e in self._history:
+            if e.get("kind") != "compensation_attempt":
+                continue
+            p = e["payload"]
+            if p.get("origin_step") != step_id:
+                continue
+            if effect_name is not None and p.get("origin_name") != str(effect_name):
+                continue
+            seen[e["id"]] = e
+        return tuple(deepcopy(seen[id_]) for id_ in sorted(seen))
+
+    def compensation_ledger(self, step_id: str | int, effect_name: str) -> dict[str, Any]:
+        """Global view of one original effect's compensation.
+
+        Aggregates every branch, so a receipt arriving late on an abandoned
+        branch still counts against the same outstanding quantity and can
+        never double-offset.
+        """
+        step_id = str(step_id)
+        name = str(effect_name)
+        effect = self.effect(step_id, name)
+        if effect["status"] != "occurred":
+            return {
+                "step": step_id, "name": name, "status": effect["status"],
+                "original": 0.0, "permitted": 0.0, "succeeded": 0.0,
+                "pending": 0.0, "failed": 0.0, "outstanding": 0.0,
+                "decision": None,
+            }
+        original = float(effect.get("quantity") if effect.get("quantity") is not None else 1.0)
+        step_record = self.get(TrainingStep._step_key(step_id))["payload"]
+        origin_id = str(step_record.get("forked_from", step_id))
+        attempts = self.compensation_attempts(origin_id, name)
+        succeeded = sum(float(a["payload"]["quantity"]) for a in attempts if a["payload"]["status"] == "succeeded")
+        pending = sum(float(a["payload"]["quantity"]) for a in attempts if a["payload"]["status"] == "unconfirmed")
+        failed = sum(float(a["payload"]["quantity"]) for a in attempts if a["payload"]["status"] == "failed")
+        decisions = self._decision_events(step_id, name)
+        latest = decisions[-1]["payload"] if decisions else None
+        decision_status = latest["decision"] if latest else None
+        permitted_qty: float
+        if latest is None or latest["decision"] == "pending":
+            permitted_qty = 0.0
+        elif latest["decision"] == "keep":
+            permitted_qty = 0.0
+        else:
+            permitted_qty = original if latest["quantity"] is None else float(latest["quantity"])
+        confirmed = latest.get("confirmed", False) if latest else False
+        outstanding = original - succeeded - pending
+        return {
+            "step": step_id, "name": name, "status": "occurred",
+            "original": original,
+            "permitted": permitted_qty,
+            "succeeded": succeeded,
+            "pending": pending,
+            "failed": failed,
+            "outstanding": outstanding,
+            "decision": decision_status,
+            "decision_confirmed": confirmed,
+        }
+
+    def decide_compensation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        decision: str,
+        *,
+        quantity: float | int | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        return self.resume_step(step_id).decide_compensation(effect_name, decision, quantity=quantity, note=note)
+
+    def compensate(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        apply: Callable[[float], Any] | None = None,
+        *,
+        quantity: float | int = 1.0,
+        compensation_id: str | None = None,
+        replay: Callable[[Any], Any] | None = None,
+    ) -> Any:
+        return self.resume_step(step_id).compensate(
+            effect_name, apply, quantity=quantity,
+            compensation_id=compensation_id, replay=replay,
+        )
+
+    def verify_compensation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        compensation_id: str,
+        succeeded: bool,
+        payload: Any = None,
+        *,
+        note: str = "",
+    ) -> dict[str, Any]:
+        return self.resume_step(step_id).verify_compensation(
+            effect_name, compensation_id, succeeded, payload, note=note,
+        )
+
+    def resolve_compensation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        *,
+        note: str = "",
+    ) -> dict[str, Any]:
+        return self.resume_step(step_id).resolve_compensation(effect_name, note=note)
+
+    def continuation(self, step_id: str | int) -> dict[str, Any]:
+        return self.resume_step(step_id).continuation()
+
+    def fork_branch(
+        self,
+        origin_step_id: str | int,
+        new_step_id: str | int,
+        model: Any | None = None,
+        *,
+        optimizer: Any | None = None,
+    ) -> "TrainingStep":
+        return TrainingStep.fork(self, origin_step_id, new_step_id, model, optimizer=optimizer)
+
     def _load_unlocked(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
             return {}
@@ -275,6 +484,7 @@ class TrainingStep:
     def __init__(self, log: TrainingEventLog, step_id: str | int, effects: list[str] | tuple[str, ...]):
         self.log = log
         self.step_id = str(step_id)
+        self._origin_step = self.step_id
         self.effect_names = [str(name) for name in effects]
         if len(self.effect_names) != len(set(self.effect_names)):
             raise ValueError("effect names within a training step must be unique")
@@ -292,6 +502,14 @@ class TrainingStep:
     def _effect_key(step_id: str | int, effect_name: str) -> str:
         return f"{TrainingStep._step_key(step_id)}:effect:{effect_name}"
 
+    @staticmethod
+    def _decision_key(step_id: str | int, effect_name: str) -> str:
+        return f"{TrainingStep._step_key(step_id)}:decision:{effect_name}"
+
+    @staticmethod
+    def _attempt_key(step_id: str | int, effect_name: str, compensation_id: str) -> str:
+        return f"{TrainingStep._step_key(step_id)}:offset:{effect_name}:{compensation_id}"
+
     @classmethod
     def resume(cls, log: TrainingEventLog, step_id: str | int) -> "TrainingStep":
         step_id = str(step_id)
@@ -299,6 +517,8 @@ class TrainingStep:
         self = cls.__new__(cls)
         self.log = log
         self.step_id = step_id
+        payload0 = payload
+        self._origin_step = str(payload.get("forked_from", step_id))
         self.effect_names = list(payload["effects"])
         if payload.get("rng_state") is not None:
             from .core import set_rng_state
@@ -323,6 +543,8 @@ class TrainingStep:
 
     def _write_state(self, state: str, **extra: Any) -> dict[str, Any]:
         payload = {"state": state, "step": self.step_id, "effects": self.effect_names}
+        if self._origin_step != self.step_id:
+            payload["forked_from"] = self._origin_step
         payload.update(extra)
         return self.log.append(
             self._step_key(self.step_id), payload,
@@ -367,6 +589,8 @@ class TrainingStep:
         effect_name: str,
         apply: Callable[[], Any] | None = None,
         replay: Callable[[Any], Any] | None = None,
+        *,
+        quantity: Callable[[Any], float] | float | int | None = None,
     ) -> Any:
         name = str(effect_name)
         key = self._effect_key(self.step_id, name)
@@ -399,10 +623,11 @@ class TrainingStep:
             self._write_effect(name, "unconfirmed", reason=repr(exc))
             self.fail(exc)
             raise
-        self._write_effect(name, "occurred", payload)
+        qty = _effect_quantity(payload, quantity)
+        self._write_effect(name, "occurred", payload, quantity=qty)
         return replay(payload) if replay is not None else deepcopy(payload)
 
-    def _write_effect(self, name: str, status: str, payload: Any = None, reason: str | None = None) -> dict[str, Any]:
+    def _write_effect(self, name: str, status: str, payload: Any = None, reason: str | None = None, *, quantity: float | None = None) -> dict[str, Any]:
         record = {
             "step": self.step_id,
             "name": name,
@@ -410,6 +635,7 @@ class TrainingStep:
             "status": status,
             "payload": payload,
             "reason": reason,
+            "quantity": quantity,
         }
         return self.log.append(
             self._effect_key(self.step_id, name), record,
@@ -456,6 +682,267 @@ class TrainingStep:
             kind="training_verification", phase="training",
         )
 
+    # --------------------------------------------------------- compensation
+    def _decision_history(self, name: str) -> list[dict[str, Any]]:
+        return self.log.compensation_decisions(self.step_id, name)
+
+    def decide_compensation(
+        self,
+        effect_name: str,
+        decision: str,
+        *,
+        quantity: float | int | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Record the human decision for an effect on an abandoned branch.
+
+        ``keep`` keeps the original registration untouched; ``offset`` permits
+        an explicit counter-effect up to ``quantity`` (default: the original
+        quantity); ``pending`` leaves the effect awaiting verification.  The
+        original effect record is never rewritten as "not executed".
+        """
+        name = str(effect_name)
+        decision = str(decision)
+        if decision not in {"keep", "offset", "pending"}:
+            raise ValueError("compensation decision must be one of 'keep', 'offset', 'pending'")
+        if name not in self.effect_names:
+            raise KeyError(f"effect {name!r} is not declared for step {self.step_id!r}")
+        record = self.log.get(self._effect_key(self.step_id, name))["payload"] if self._has_effect(name) else {"status": "not_executed"}
+        if record["status"] != "occurred":
+            raise NoEffectEvidenceError(
+                f"cannot decide compensation for {name!r}: the original effect is {record['status']}, "
+                "not proven to have occurred"
+            )
+        original = float(record.get("quantity") if record.get("quantity") is not None else 1.0)
+        if decision == "offset":
+            if quantity is None:
+                quantity = original
+            quantity = float(quantity)
+            if quantity <= 0:
+                raise CompensationLimitError("offset quantity must be positive")
+            if quantity > original + 1e-9:
+                raise CompensationLimitError(
+                    f"offset scope {quantity} exceeds the original effect quantity {original}"
+                )
+            ledger = self.log.compensation_ledger(self.step_id, name)
+            if ledger["succeeded"] - quantity > 1e-9:
+                raise CompensationLimitError(
+                    f"cannot narrow offset scope to {quantity}: {ledger['succeeded']} already compensated"
+                )
+        payload = {
+            "step": self.step_id,
+            "name": name,
+            "decision": decision,
+            "quantity": quantity,
+            "note": note,
+            "confirmed": decision in {"keep"},
+        }
+        return self.log.append(
+            self._decision_key(self.step_id, name), payload,
+            kind="compensation_decision", phase="compensation", overwrite=True,
+        )
+
+    def compensate(
+        self,
+        effect_name: str,
+        apply: Callable[[float], Any] | None = None,
+        *,
+        quantity: float | int = 1.0,
+        compensation_id: str | None = None,
+        replay: Callable[[Any], Any] | None = None,
+    ) -> Any:
+        """Apply one counter-effect against a proven original effect.
+
+        Idempotent by ``compensation_id`` (defaults to the effect name): a
+        duplicated request returns the recorded receipt without applying
+        again.  Late receipts stay ``unconfirmed`` and must be settled with
+        :meth:`verify_compensation`.
+        """
+        name = str(effect_name)
+        comp_id = str(compensation_id if compensation_id is not None else name)
+        origin_id = self._origin_step
+        if name not in self.effect_names:
+            raise KeyError(f"effect {name!r} is not declared for step {self.step_id!r}")
+        origin_key = TrainingStep._effect_key(origin_id, name)
+        origin_effect = self.log.get(origin_key)["payload"] if origin_key in self.log else {"status": "not_executed"}
+        if origin_effect["status"] != "occurred":
+            raise NoEffectEvidenceError(
+                f"cannot compensate {name!r}: original effect is {origin_effect['status']}"
+            )
+        decisions = self._decision_history(name)
+        if not decisions or decisions[-1]["payload"]["decision"] != "offset":
+            raise CompensationStateError(
+                f"no open 'offset' decision for {name!r}; a human decision is required before compensation"
+            )
+        quantity = float(quantity)
+        if quantity <= 0:
+            raise CompensationLimitError("compensation quantity must be positive")
+        key = self._attempt_key(origin_id, name, comp_id)
+        if key in self.log:
+            existing = self.log.get(key)["payload"]
+            if abs(float(existing["quantity"]) - quantity) > 1e-9:
+                raise CompensationLimitError(
+                    f"compensation {comp_id!r} already requested with quantity {existing['quantity']}"
+                )
+            if existing["status"] == "succeeded":
+                return replay(existing["payload"]) if replay is not None else deepcopy(existing["payload"])
+            raise CompensationStateError(
+                f"compensation {comp_id!r} is {existing['status']}; verify it before requesting again"
+            )
+        ledger = self.log.compensation_ledger(self.step_id, name)
+        available = ledger["permitted"] - ledger["succeeded"] - ledger["pending"]
+        if quantity > available + 1e-9:
+            raise CompensationLimitError(
+                f"compensation {quantity} exceeds remaining offset scope {available:.12g} "
+                f"(permitted {ledger['permitted']}, succeeded {ledger['succeeded']}, pending {ledger['pending']})"
+            )
+        if apply is None:
+            raise ValueError("apply(quantity) is required for a new compensation")
+        base = {
+            "origin_step": origin_id,
+            "origin_name": name,
+            "compensation_id": comp_id,
+            "branch_step": self.step_id,
+            "quantity": quantity,
+        }
+        try:
+            receipt = apply(quantity)
+        except ExternalEffectUncertain as exc:
+            self._write_attempt(key, {**base, "status": "unconfirmed", "payload": None, "reason": str(exc)})
+            raise
+        except Exception as exc:
+            # Failure is definitive for the call itself; no quantity is reserved.
+            self._write_attempt(key, {**base, "status": "failed", "payload": None, "reason": repr(exc)})
+            raise
+        self._write_attempt(key, {**base, "status": "succeeded", "payload": receipt, "reason": None})
+        return replay(receipt) if replay is not None else deepcopy(receipt)
+
+    def _write_attempt(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.log.append(key, payload, kind="compensation_attempt", phase="compensation", overwrite=True)
+
+    def verify_compensation(
+        self,
+        effect_name: str,
+        compensation_id: str,
+        succeeded: bool,
+        payload: Any = None,
+        *,
+        note: str = "",
+    ) -> dict[str, Any]:
+        name = str(effect_name)
+        comp_id = str(compensation_id)
+        key = self._attempt_key(self._origin_step, name, comp_id)
+        if key not in self.log:
+            raise CompensationStateError(f"no compensation {comp_id!r} recorded for {name!r}")
+        current = self.log.get(key)["payload"]
+        if current["status"] != "unconfirmed":
+            if (current["status"] == "succeeded") != bool(succeeded):
+                raise CompensationStateError(
+                    f"compensation {comp_id!r} already settled as {current['status']}"
+                )
+            settled = dict(current)
+        else:
+            status = "succeeded" if succeeded else "failed"
+            settled = {**current, "status": status, "payload": payload if succeeded else None}
+            if not succeeded:
+                settled["reason"] = note or "verified as not applied"
+            self._write_attempt(key, settled)
+        self._append_compensation_verification(name, comp_id, succeeded, note)
+        return self.log.get(key)
+
+    def _append_compensation_verification(self, name: str, comp_id: str, succeeded: bool, note: str) -> dict[str, Any]:
+        sequence = [
+            e for e in self.log.events
+            if e.get("kind") == "compensation_verification"
+            and e["payload"].get("origin_step") == self._origin_step
+        ]
+        verification_id = f"{self._step_key(self.step_id)}:offset-verification:{len(sequence)}"
+        return self.log.append(
+            verification_id,
+            {"origin_step": self.step_id, "origin_name": name,
+             "compensation_id": comp_id, "succeeded": bool(succeeded), "note": note},
+            kind="compensation_verification", phase="compensation",
+        )
+
+    def resolve_compensation(self, effect_name: str, *, note: str = "") -> dict[str, Any]:
+        """Close an open offset decision once outstanding quantity is zero."""
+        name = str(effect_name)
+        ledger = self.log.compensation_ledger(self.step_id, name)
+        if ledger["decision"] != "offset":
+            raise CompensationStateError(f"effect {name!r} has no open offset decision")
+        if ledger["pending"]:
+            raise CompensationStateError(
+                f"cannot resolve {name!r}: {ledger['pending']} of compensation is still unconfirmed"
+            )
+        if ledger["outstanding"] > 1e-9:
+            raise CompensationStateError(
+                f"cannot resolve {name!r}: {ledger['outstanding']} is not compensated yet"
+            )
+        decisions = self._decision_history(name)
+        latest = dict(decisions[-1]["payload"])
+        latest["confirmed"] = True
+        latest["note"] = (latest.get("note") or "")
+        if note:
+            latest["note"] = f"{latest['note']} | {note}" if latest["note"] else note
+        return self.log.append(
+            self._decision_key(self.step_id, name), latest,
+            kind="compensation_decision", phase="compensation", overwrite=True,
+        )
+
+    def effect_resolution(self, effect_name: str) -> dict[str, Any]:
+        """Per-effect external-conflict status after compensation."""
+        name = str(effect_name)
+        record = self._effect_record(name) if self._has_effect(name) else {
+            "status": "not_executed", "quantity": None,
+        }
+        if record["status"] != "occurred":
+            return {"name": name, "status": record["status"], "resolved": record["status"] != "unconfirmed",
+                    "reason": f"original effect {record['status']}", **{
+                        k: 0.0 for k in ("original", "permitted", "succeeded", "pending", "outstanding")
+                    }}
+        ledger = self.log.compensation_ledger(self.step_id, name)
+        if ledger["decision"] is None or ledger["decision"] == "pending":
+            resolved, reason = False, "awaiting verification/decision"
+        elif ledger["decision"] == "keep":
+            resolved, reason = True, "original registration retained"
+        elif ledger["pending"]:
+            resolved, reason = False, "compensation receipt unconfirmed"
+        elif ledger["outstanding"] <= 1e-9:
+            resolved, reason = True, "fully compensated"
+        else:
+            resolved, reason = False, f"{ledger['outstanding']:g} remains uncompensated"
+        return {"name": name, "status": "occurred", "resolved": resolved, "reason": reason,
+                "original": ledger["original"], "permitted": ledger["permitted"],
+                "succeeded": ledger["succeeded"], "pending": ledger["pending"],
+                "outstanding": ledger["outstanding"], "decision": ledger["decision"]}
+
+    def continuation(self) -> dict[str, Any]:
+        """Which dependent downstream effects/training may proceed.
+
+        Effects are declared in dependency order: an effect may proceed when
+        every effect before it is resolved (their external facts no longer
+        conflict with the new plan).  Effects that are themselves unresolved
+        stay listed under ``blocked`` even when their prerequisites are clear,
+        because the effect itself still clashes with external reality.
+        """
+        statuses = [self.effect_resolution(name) for name in self.effect_names]
+        runnable_names = [s["name"] for i, s in enumerate(statuses)
+                         if all(statuses[j]["resolved"] for j in range(i))]
+        blocked_names = [s["name"] for s in statuses if not s["resolved"]]
+        # A continuation candidate is an effect still conflicting with
+        # external reality whose prerequisites are already settled: it is the
+        # next training step that may be retried/decided.
+        proceed_names = [s["name"] for i, s in enumerate(statuses)
+                         if i > 0 and not s["resolved"] and all(statuses[j]["resolved"] for j in range(i))]
+        return {
+            "effects": {s["name"]: s for s in statuses},
+            "resolved": [s["name"] for s in statuses if s["resolved"]],
+            "conflicting": [s["name"] for s in statuses if not s["resolved"]],
+            "can_continue": proceed_names,
+            "prerequisites_ready": runnable_names,
+            "blocked": blocked_names,
+        }
+
     def fail(self, reason: BaseException | str | None = None) -> dict[str, Any]:
         if self.state in {"complete", "failed"}:
             return self.log.get(self._step_key(self.step_id))
@@ -496,10 +983,95 @@ class TrainingStep:
             "model_before_optimizer": before,
             "model_after_optimizer": after,
             "gradient_digest": grad_digest,
+            "optimizer": _optimizer_snapshot(optimizer),
             "rng_state": get_rng_state(),
         }
         self._write_state("complete", statuses=statuses, completion=completion)
         return self.log.get(self._step_key(self.step_id))
+
+    # ------------------------------------------------------------- branching
+    @classmethod
+    def fork(
+        cls,
+        log: "TrainingEventLog",
+        origin_step_id: str | int,
+        new_step_id: str | int,
+        model: Any | None = None,
+        *,
+        optimizer: Any | None = None,
+        effects: list[str] | tuple[str, ...] | None = None,
+    ) -> "TrainingStep":
+        """Start a new branch from a confirmed computation checkpoint.
+
+        The new branch inherits the external facts that really happened on
+        the origin step (occurred effects, and already-confirmed compensation
+        results) but never inherits another branch's unconfirmed compensation
+        decisions.  Model parameters, gradients and optimizer state are
+        restored to the origin step's actual post-update computation; no
+        optimizer update is applied while processing compensation.
+        """
+        origin_id = str(origin_step_id)
+        new_id = str(new_step_id)
+        origin_key = cls._step_key(origin_id)
+        if origin_key not in log:
+            raise KeyError(f"origin step {origin_id!r} does not exist")
+        origin_payload = log.get(origin_key)["payload"]
+        if origin_payload.get("state") != "complete":
+            raise IncompleteTrainingStepError(
+                f"origin step {origin_id!r} is {origin_payload.get('state')}, not a confirmed checkpoint"
+            )
+        if cls._step_key(new_id) in log:
+            raise EventExistsError(f"training step {new_id!r} already exists")
+
+        completion = origin_payload["completion"]
+        from .core import set_rng_state
+        set_rng_state(completion["rng_state"])
+
+        if model is not None:
+            params = list(model.parameters())
+            saved = completion["model_after_optimizer"]["parameters"]
+            if len(params) != len(saved):
+                raise ValueError("fork model has a different number of parameters than the origin")
+            import numpy as np
+            for p, values in zip(params, saved):
+                p.data = np.asarray(values, dtype=np.float64)
+                p.grad = None
+        if optimizer is not None and completion.get("optimizer") is not None:
+            _restore_optimizer(optimizer, completion["optimizer"])
+
+        origin_effect_names = list(origin_payload["effects"])
+        new_names = [str(n) for n in (effects if effects is not None else origin_effect_names)]
+        if len(new_names) != len(set(new_names)):
+            raise ValueError("effect names within a training step must be unique")
+
+        self = cls.__new__(cls)
+        self.log = log
+        self.step_id = new_id
+        self._origin_step = str(origin_payload.get("forked_from", origin_id))
+        self.effect_names = new_names
+        inherited: dict[str, Any] = {}
+        # Seed occurred original facts.  Their payload is the real external
+        # fact; compensation quantities already succeeded remain charged
+        # against the origin effect via the global ledger.
+        for name in origin_effect_names:
+            if name not in new_names:
+                continue
+            src = log.get(cls._effect_key(origin_id, name))["payload"]
+            if src["status"] == "occurred":
+                seed = dict(src)
+                seed["step"] = new_id
+                seed["forked_from"] = origin_id
+                log.append(
+                    cls._effect_key(new_id, name), seed,
+                    kind="training_effect", phase="training", overwrite=True,
+                )
+                inherited[name] = {"status": "occurred", "payload": deepcopy(seed["payload"])}
+        self._write_state(
+            "started", effects=self.effect_names,
+            forked_from=origin_id, inherited_facts=inherited,
+            rng_state=completion["rng_state"],
+        )
+        return self
 
 
 @contextmanager

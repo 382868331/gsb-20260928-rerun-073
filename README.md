@@ -143,6 +143,64 @@ except Exception as exc:
 失败/待续步骤，不会伪装成普通完成步骤。原失败原因与每次用户核实记录都作为追加 JSONL 事件
 保留，可通过 `log.step_failure(step)` 和 `log.audit_events(step)` 追查。
 
+### 放弃训练分支后的补偿安排
+
+回退模型检查点不会、也不允许删除已经实际发生的外部效果。放弃一条训练分支时，
+由使用者对每个已确认（`occurred`）的原效果作出明确决定，原效果记录始终保持
+“已发生”，不会被改写成“未执行”：
+
+- `decide_compensation(step, effect, "keep")`：明确保留原登记；
+- `decide_compensation(step, effect, "offset", quantity=...)`：申请抵消效果，
+  允许补偿的数量默认为原效果数量，且不得超过它；
+- `decide_compensation(step, effect, "pending")`：仍等待人工核实。
+
+`run_effect(..., quantity=...)` 可传入数字或从 payload 提取数量的函数，作为该
+效果的原始数量；未提供时按 1 计。补偿本身同样有三种结局：
+
+- `log.compensate(step, effect, apply, quantity=..., compensation_id=...)` 执行
+  抵消并保存回执；同一 `compensation_id` 的重复申请直接回放既有回执，**不会再次
+  执行**。部分补偿可分多次申请，可补偿余额为“允许量 − 已成功 − 待确认”，超额
+  立即抛 `CompensationLimitError`。
+- `apply` 抛 `ExternalEffectUncertain` 时补偿记为 `unconfirmed`，其数量先占用
+  额度以防双重抵消；回执迟到后用
+  `verify_compensation(step, effect, id, succeeded, payload)` 一次性落账——成功
+  才计入已补偿，失败则释放占用。对同一结论重复核实是幂等的，不会重复计数。
+- 没有证据证明原效果发生（`unconfirmed`/`not_executed`）时，任何补偿决定或
+  执行都抛 `NoEffectEvidenceError`，补偿不会自动发生。
+
+全部补偿完成且没有待确认回执时，用 `resolve_compensation(step, effect)` 关闭该
+效果的补偿决定。`log.continuation(step)` 按声明顺序考虑效果之间的依赖，返回：
+
+- `resolved`：外部事实已不再与新计划冲突（保留或已全额抵消）；
+- `blocked`/`conflicting`：仍与外部事实冲突的效果；
+- `can_continue`：前置效果均已解决、可以继续处理/重试的后续训练步骤。
+
+```python
+log.decide_compensation(1, "register", "offset", quantity=5)
+log.compensate(1, "register", api.cancel, quantity=3, compensation_id="p1")
+log.verify_compensation(1, "register", "p2", True, receipt, note="late receipt")
+log.resolve_compensation(1, "register")
+log.continuation(1)  # 哪些后续步骤可继续，哪些仍与外部事实冲突
+```
+
+补偿台账按“原始效果”全局汇总（`compensation_ledger(step, effect)`）：即使补偿
+回执在已放弃的分支上迟到，或补偿发生在另一个新分支上，都冲减同一份未抵消余额，
+跨分支也不可能双重抵消。
+
+### 从已确认检查点建立新分支
+
+`log.fork_branch(origin_step, new_step, model, optimizer=opt)` 只能从状态为
+`complete` 的计算检查点派生：
+
+- 新分支**继承真实发生的外部事实**（`occurred` 效果及其 payload 可直接回放）；
+- **不继承另一分支尚未获确认的补偿决定**——新分支上执行补偿前必须重新作出
+  `offset` 决定；但已成功的补偿结果通过全局台账继续约束同一原效果；
+- 模型参数恢复为原步骤优化器更新**之后**的实际值，梯度清空，优化器状态
+  （SGD 动量 / Adam 的 t、m、v）与 RNG 状态一并恢复；处理补偿时不调用任何
+  optimizer 更新，因此检查点的更新不会被重复应用一次。
+
+完整流程见 `examples/compensation_branch.py`。
+
 ## 正确性验证
 
 `tests/` 使用**中心差分数值梯度**独立核对所有核心算子与组合图
