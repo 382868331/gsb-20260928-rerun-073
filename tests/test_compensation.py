@@ -86,8 +86,13 @@ def test_run_compensation_is_idempotent_and_scoped(tmp_path):
     assert rec["quantity_allowed"] == 3.0
     assert rec["target"].endswith(":effect:register")
 
-    # quantity is clamped to the remaining scope: no double offset
-    log.run_compensation(0, "register", lambda: calls.append(1) or {"offset": 2}, quantity=5.0)
+    # a request beyond the remaining scope is refused before any external
+    # action: the approval boundary is never faked by trimming the record
+    with pytest.raises(CompensationError):
+        log.run_compensation(0, "register", lambda: calls.append(1) or {"offset": 2}, quantity=5.0)
+    assert calls == [1]
+    assert log.compensation(0, "register")["quantity_compensated"] == 2.0
+    log.run_compensation(0, "register", lambda: calls.append(1) or {"offset": 2}, quantity=1.0)
     assert log.compensation(0, "register")["quantity_compensated"] == 3.0
     # fully compensated: repeated applications replay, never re-apply
     again = log.run_compensation(0, "register", lambda: calls.append(1) or {"offset": 3})
@@ -277,3 +282,144 @@ def test_random_compute_and_multiple_backwards_around_compensation(tmp_path):
     step = reopened.resume_step(0)
     again = step.run_effect("batch", replay=lambda p: tensor(np.random.default_rng(p["seed"]).standard_normal((4, 4))))
     assert np.allclose(again.data, batch.data)
+
+
+# ------------------------------------------------------- approval boundary
+def test_over_approval_request_refused_before_external_action(tmp_path):
+    # approved 5, already compensated 3, then a request for 4 arrives:
+    # the old behaviour silently recorded 2 internally while executing 4
+    # externally (7 actual vs 5 approved). The request must now be refused
+    # before any external action runs.
+    log = ad.TrainingEventLog(tmp_path / "log.jsonl")
+    run_completed_step(log, 0, effects=["register"])
+    log.decide_compensation(0, "register", "compensate", quantity=5.0)
+
+    external = []
+    log.run_compensation(0, "register", lambda: external.append(3.0) or {"offset": 3}, quantity=3.0)
+    rec = log.compensation(0, "register")
+    assert rec["quantity_compensated"] == 3.0
+    assert rec["quantity_remaining"] == 2.0
+
+    with pytest.raises(CompensationError):
+        log.run_compensation(0, "register", lambda: external.append(4.0) or {"offset": 4}, quantity=4.0)
+    # nothing executed externally and the book was not trimmed to fake compliance
+    assert external == [3.0]
+    assert log.compensation(0, "register")["quantity_compensated"] == 3.0
+
+    # the remaining 2 is still executable; afterwards the approval is exactly used up
+    log.run_compensation(0, "register", lambda: external.append(2.0) or {"offset": 2}, quantity=2.0)
+    assert external == [3.0, 2.0]
+    assert sum(external) == 5.0
+    rec = log.compensation(0, "register")
+    assert rec["quantity_compensated"] == 5.0
+    assert rec["quantity_remaining"] == 0.0
+
+
+def test_unconfirmed_attempt_reserves_approval(tmp_path):
+    log = ad.TrainingEventLog(tmp_path / "log.jsonl")
+    run_completed_step(log, 0, effects=["register"])
+    log.decide_compensation(0, "register", "compensate", quantity=5.0)
+    log.run_compensation(0, "register", lambda: {"offset": 1}, quantity=1.0)
+
+    # receipt lost: the attempt's quantity stays reserved, neither consumed
+    # nor assumed not to have happened
+    with pytest.raises(ad.ExternalEffectUncertain):
+        log.run_compensation(
+            0, "register",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("receipt lost")),
+            quantity=3.0,
+        )
+    rec = log.compensation(0, "register")
+    assert rec["status"] == "unconfirmed"
+    assert rec["quantity_compensated"] == 1.0
+    assert rec["quantity_pending"] == 3.0
+    assert rec["quantity_remaining"] == 1.0
+
+    # a retry may not double-consume the reservation
+    calls = []
+    with pytest.raises(ad.UnconfirmedEffectError):
+        log.run_compensation(0, "register", lambda: calls.append(1) or {"offset": 3}, quantity=3.0)
+    assert calls == []
+
+    # human confirms a partial success: 2 of the reserved 3 really happened,
+    # the rest is released; both the fact and the attempt's basis are kept
+    rec = log.verify_compensation(0, "register", True, {"offset": 2}, quantity=2.0, note="partial receipt")
+    assert rec["quantity_compensated"] == 3.0
+    assert rec["quantity_pending"] == 0.0
+    assert log.compensation(0, "register")["quantity_remaining"] == 2.0
+    # a duplicate confirmation is audited but never compensates twice
+    rec = log.verify_compensation(0, "register", True, {"offset": 2}, note="duplicate")
+    assert rec["quantity_compensated"] == 3.0
+    kinds = [e["kind"] for e in log.audit_events(0)]
+    assert "compensation_attempt" in kinds
+    attempt = [e for e in log.audit_events(0) if e["kind"] == "compensation_attempt"][0]
+    assert attempt["payload"]["quantity"] == 3.0
+    verification = [e for e in log.audit_events(0) if e["kind"] == "compensation_verification"][0]
+    assert verification["payload"]["quantity"] == 2.0
+    assert verification["payload"]["released"] == 1.0
+
+
+def test_concurrent_branches_late_receipt_and_recovery_reconcile(tmp_path):
+    # main log: approved 5, confirmed 3, then a receipt is lost for 2 more
+    main_path = tmp_path / "main.jsonl"
+    log = ad.TrainingEventLog(main_path)
+    run_completed_step(log, 0, effects=["register"])
+    log.decide_compensation(0, "register", "compensate", quantity=5.0)
+    external_main = []
+    log.run_compensation(0, "register", lambda: external_main.append(3.0) or {"offset": 3}, quantity=3.0)
+    with pytest.raises(ad.ExternalEffectUncertain):
+        log.run_compensation(
+            0, "register",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("crash after send")),
+            quantity=2.0,
+        )
+
+    # two concurrent branches fork from the same checkpoint: both inherit the
+    # confirmed 3 and the pending reservation of 2, so neither can re-spend
+    # the same approval
+    branch_a = log.create_branch("retry-a", 0, tmp_path / "branch-a.jsonl")
+    branch_b = log.create_branch("retry-b", 0, tmp_path / "branch-b.jsonl")
+    for branch in (branch_a, branch_b):
+        branch.decide_compensation(0, "register", "compensate", quantity=5.0)
+        rec = branch.compensation(0, "register")
+        assert rec["quantity_compensated"] == 3.0
+        assert rec["quantity_pending"] == 2.0
+        assert rec["quantity_remaining"] == 0.0
+        # no executable balance while the receipt is outstanding
+        with pytest.raises(ad.UnconfirmedEffectError):
+            branch.run_compensation(0, "register", lambda: {"offset": 2}, quantity=2.0)
+
+    # process restart on main: the reservation survives recovery
+    reopened = ad.TrainingEventLog(main_path)
+    rec = reopened.compensation(0, "register")
+    assert rec["quantity_compensated"] == 3.0
+    assert rec["quantity_pending"] == 2.0
+    assert rec["quantity_remaining"] == 0.0
+
+    # the late receipt arrives on main and confirms the reserved 2
+    reopened.verify_compensation(0, "register", True, {"offset": 2}, note="late receipt")
+    assert reopened.compensation(0, "register")["quantity_compensated"] == 5.0
+    external_main.append(2.0)  # the external world really did apply it
+
+    # branch A learns the same outcome from the human and resolves its
+    # inherited reservation identically: confirmed, never re-executed
+    rec_a = branch_a.verify_compensation(0, "register", True, {"offset": 2}, note="same late receipt")
+    assert rec_a["quantity_compensated"] == 5.0
+    assert rec_a["quantity_pending"] == 0.0
+
+    # branch B is told the attempt actually failed: the reservation is
+    # released there and only there may the remaining 2 still execute
+    rec_b = branch_b.verify_compensation(0, "register", False, note="receipt: not applied")
+    assert rec_b["quantity_compensated"] == 3.0
+    assert rec_b["quantity_pending"] == 0.0
+    external_b = []
+    branch_b.run_compensation(0, "register", lambda: external_b.append(2.0) or {"offset": 2}, quantity=2.0)
+    assert branch_b.compensation(0, "register")["quantity_compensated"] == 5.0
+
+    # every timeline reconciles: external quantities never exceed the
+    # approved 5 and the book matches the external facts on each branch
+    assert sum(external_main) == 5.0
+    assert sum(external_b) == 2.0 and 3.0 + sum(external_b) == 5.0
+    for log_ in (reopened, branch_a, branch_b):
+        rec = log_.compensation(0, "register")
+        assert rec["quantity_compensated"] + rec["quantity_pending"] <= rec["quantity_allowed"]

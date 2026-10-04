@@ -234,7 +234,22 @@ class TrainingEventLog:
         return {name: payload["status"] for name, payload in self.effects(step_id).items()}
 
     def effect(self, step_id: str | int, effect_name: str) -> dict[str, Any]:
-        return deepcopy(self.get(TrainingStep._effect_key(step_id, effect_name))["payload"])
+        key = TrainingStep._effect_key(step_id, effect_name)
+        if key in self._events:
+            return deepcopy(self._events[key]["payload"])
+        inherited = self._inherited_fact("inherited_effect", step_id, effect_name)
+        if inherited is not None:
+            return inherited
+        raise KeyError(key)
+
+    def _inherited_fact(self, kind: str, step_id: str | int, name: str) -> dict[str, Any] | None:
+        for event in self._events.values():
+            if event.get("kind") != kind:
+                continue
+            payload = event["payload"]
+            if str(payload.get("step")) == str(step_id) and payload.get("name") == str(name):
+                return deepcopy(payload)
+        return None
 
     def verify_effect(self, step_id: str | int, effect_name: str, occurred: bool, payload: Any = None, *, note: str = ""):
         return self.resume_step(step_id).verify_effect(effect_name, occurred, payload, note=note)
@@ -280,6 +295,7 @@ class TrainingEventLog:
             "status": record["status"],
             "quantity_allowed": record["quantity_allowed"],
             "quantity_compensated": record["quantity_compensated"],
+            "quantity_pending": record.get("quantity_pending", 0.0),
             "note": note,
         }
         payload.update(extra)
@@ -317,36 +333,71 @@ class TrainingEventLog:
         key = self._comp_key(step_id, name)
         if key in self._events:
             record = deepcopy(self._events[key]["payload"])
+            record.setdefault("quantity_pending", 0.0)
             if record["status"] == "occurred" and record["decision"] != decision:
                 raise EventExistsError(
                     f"compensation for effect {name!r} already executed; the decision is locked"
                 )
             record["decision"] = decision
             if quantity is not None:
-                if float(quantity) < record["quantity_compensated"]:
+                committed = record["quantity_compensated"] + record["quantity_pending"]
+                if float(quantity) < committed:
                     raise CompensationError(
-                        "allowed quantity cannot be below the already compensated amount"
+                        "allowed quantity cannot be below the already compensated "
+                        "or pending-verification amount"
                     )
                 record["quantity_allowed"] = float(quantity)
         else:
-            record = {
-                "step": step_id,
-                "name": name,
-                "target": TrainingStep._effect_key(step_id, name),
-                "decision": decision,
-                "status": "not_started",
-                "quantity_allowed": 1.0 if quantity is None else float(quantity),
-                "quantity_compensated": 0.0,
-                "payload": None,
-                "reason": None,
-            }
+            inherited = self._inherited_fact("inherited_compensation", step_id, name)
+            if inherited is not None:
+                # A branch continues the same approval instead of opening a
+                # fresh one: confirmed quantities and pending reservations
+                # are inherited facts, so the approval is never reused.
+                record = {
+                    "step": step_id,
+                    "name": name,
+                    "target": TrainingStep._effect_key(step_id, name),
+                    "decision": decision,
+                    "status": inherited.get("status") if inherited.get("status") in ("occurred", "unconfirmed") else "not_started",
+                    "quantity_allowed": float(inherited.get("quantity_allowed", 1.0)),
+                    "quantity_compensated": float(inherited.get("quantity_compensated", 0.0)),
+                    "quantity_pending": float(inherited.get("quantity_pending", 0.0)),
+                    "payload": deepcopy(inherited.get("payload")),
+                    "reason": inherited.get("reason"),
+                }
+                if quantity is not None:
+                    committed = record["quantity_compensated"] + record["quantity_pending"]
+                    if float(quantity) < committed:
+                        raise CompensationError(
+                            "allowed quantity cannot be below the already compensated "
+                            "or pending-verification amount"
+                        )
+                    record["quantity_allowed"] = float(quantity)
+            else:
+                record = {
+                    "step": step_id,
+                    "name": name,
+                    "target": TrainingStep._effect_key(step_id, name),
+                    "decision": decision,
+                    "status": "not_started",
+                    "quantity_allowed": 1.0 if quantity is None else float(quantity),
+                    "quantity_compensated": 0.0,
+                    "quantity_pending": 0.0,
+                    "payload": None,
+                    "reason": None,
+                }
         self._write_compensation(record)
         self._append_compensation_audit(record, "decision", note, {})
         return deepcopy(record)
 
     def compensation(self, step_id: str | int, effect_name: str) -> dict[str, Any]:
         """Current compensation record: target, decision, scope and progress."""
-        return self._compensation_record(step_id, effect_name)
+        record = self._compensation_record(step_id, effect_name)
+        record.setdefault("quantity_pending", 0.0)
+        record["quantity_remaining"] = (
+            record["quantity_allowed"] - record["quantity_compensated"] - record["quantity_pending"]
+        )
+        return record
 
     def compensations(self, step_id: str | int) -> dict[str, dict[str, Any]]:
         prefix = f"{TrainingStep._step_key(step_id)}:effect:"
@@ -368,12 +419,18 @@ class TrainingEventLog:
         """Execute the compensating effect once, within the allowed scope.
 
         Idempotent: an already confirmed compensation is replayed, never
-        re-applied; quantities are clamped to the remaining allowed scope so
-        duplicate requests cannot double-offset the original fact.
+        re-applied. A request exceeding the remaining approved scope is
+        refused *before* any external action runs: the approval boundary and
+        the actual external quantity can never diverge by trimming only the
+        internal record. A request whose receipt is lost stays "unconfirmed"
+        with its quantity reserved (pending verification), so a retry can
+        neither double-consume the approval nor assume the external action
+        did not happen.
         """
         step_id = str(step_id)
         name = str(effect_name)
         record = self._compensation_record(step_id, name)
+        record.setdefault("quantity_pending", 0.0)
         if record["decision"] != "compensate":
             raise CompensationError(
                 f"effect {name!r} is decided as {record['decision']!r}, not 'compensate'"
@@ -384,13 +441,16 @@ class TrainingEventLog:
                 f"effect {name!r} of step {step_id!r} is {effect_status}; without evidence "
                 "that the original effect occurred no compensation may execute"
             )
-        remaining = record["quantity_allowed"] - record["quantity_compensated"]
+        remaining = (
+            record["quantity_allowed"] - record["quantity_compensated"] - record["quantity_pending"]
+        )
         if record["status"] == "occurred" and remaining <= 0:
             return replay(record["payload"]) if replay is not None else deepcopy(record["payload"])
         if record["status"] == "unconfirmed":
             raise UnconfirmedEffectError(
                 f"compensation for effect {name!r} is unconfirmed; "
-                "call verify_compensation with the late receipt before retrying"
+                f"its quantity ({record['quantity_pending']}) stays reserved against the "
+                "approval; call verify_compensation with the late receipt before retrying"
             )
         if remaining <= 0:
             if replay is not None and record["payload"] is not None:
@@ -398,23 +458,41 @@ class TrainingEventLog:
             return deepcopy(record["payload"])
         if apply is None:
             raise ValueError("apply is required for a compensation that has not completed")
-        qty = remaining if quantity is None else min(float(quantity), remaining)
+        if quantity is not None and float(quantity) > remaining:
+            raise CompensationError(
+                f"requested compensation quantity {float(quantity)} exceeds the remaining "
+                f"approved scope {remaining} for effect {name!r}; the request is refused "
+                "before any external action, so the approval boundary is never faked by "
+                "trimming only the internal record"
+            )
+        qty = remaining if quantity is None else float(quantity)
         try:
             payload = apply()
         except ExternalEffectUncertain as exc:
             record["status"] = "unconfirmed"
             record["reason"] = str(exc)
+            record["quantity_pending"] += qty
             self._write_compensation(record)
+            self._append_compensation_audit(
+                record, "attempt", str(exc), {"quantity": qty, "outcome": "unconfirmed"}
+            )
             raise
         except ExternalEffectNotExecuted as exc:
             record["status"] = "not_occurred"
             record["reason"] = str(exc)
             self._write_compensation(record)
+            self._append_compensation_audit(
+                record, "attempt", str(exc), {"quantity": qty, "outcome": "not_occurred"}
+            )
             raise
         except Exception as exc:
             record["status"] = "unconfirmed"
             record["reason"] = repr(exc)
+            record["quantity_pending"] += qty
             self._write_compensation(record)
+            self._append_compensation_audit(
+                record, "attempt", repr(exc), {"quantity": qty, "outcome": "unconfirmed"}
+            )
             raise
         record["status"] = "occurred"
         record["payload"] = payload
@@ -437,11 +515,16 @@ class TrainingEventLog:
         """Resolve an unconfirmed compensation from a (possibly late) receipt.
 
         Confirming an already confirmed compensation only appends an audit
-        record; the compensated quantity never increases twice.
+        record; the compensated quantity never increases twice. Confirming an
+        unconfirmed attempt credits exactly the quantity that attempt reserved
+        against the approval (or a explicitly stated partial amount); the
+        remainder of the reservation is released. The original occurrence
+        facts and every attempt's basis stay in the audit trail.
         """
         step_id = str(step_id)
         name = str(effect_name)
         record = self._compensation_record(step_id, name)
+        record.setdefault("quantity_pending", 0.0)
         if record["status"] == "occurred":
             if not occurred:
                 raise EventExistsError(
@@ -454,17 +537,31 @@ class TrainingEventLog:
                 f"compensation for effect {name!r} is {record['status']}; nothing to verify"
             )
         if occurred:
-            remaining = record["quantity_allowed"] - record["quantity_compensated"]
-            qty = remaining if quantity is None else min(float(quantity), remaining)
+            pending = record["quantity_pending"]
+            if quantity is not None and float(quantity) > pending:
+                raise CompensationError(
+                    f"cannot confirm quantity {float(quantity)} for effect {name!r}: only "
+                    f"{pending} is reserved by the unconfirmed attempt; confirming more "
+                    "would consume the approval twice"
+                )
+            qty = pending if quantity is None else float(quantity)
             record["status"] = "occurred"
             record["payload"] = payload
             record["reason"] = None
             record["quantity_compensated"] += qty
+            record["quantity_pending"] = 0.0
+            extra = {"occurred": True, "quantity": qty, "released": pending - qty}
         else:
             record["status"] = "not_occurred"
             record["payload"] = None
+            extra = {
+                "occurred": False,
+                "quantity": 0.0,
+                "released": record["quantity_pending"],
+            }
+            record["quantity_pending"] = 0.0
         self._write_compensation(record)
-        self._append_compensation_audit(record, "verification", note, {"occurred": bool(occurred)})
+        self._append_compensation_audit(record, "verification", note, extra)
         return deepcopy(record)
 
     # ----------------------------------------------------- resolution
@@ -571,7 +668,9 @@ class TrainingEventLog:
                     f"branch:{branch_id}:fact:{key}", deepcopy(event["payload"]),
                     kind="inherited_effect", phase="training",
                 )
-            elif kind == "compensation" and status == "occurred":
+            elif kind == "compensation" and (
+                status == "occurred" or event["payload"].get("quantity_pending", 0.0) > 0
+            ):
                 branch.append(
                     f"branch:{branch_id}:fact:{key}", deepcopy(event["payload"]),
                     kind="inherited_compensation", phase="training",

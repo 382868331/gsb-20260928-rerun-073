@@ -155,10 +155,17 @@ log.decide_compensation(step, "publish", "pending")                  # 仍等待
 ```
 
 - `run_compensation(step, name, apply, replay, quantity=...)` 执行抵消效果，本身也会落入
-  `occurred / unconfirmed / not_occurred`；已确认的补偿再次申请只会重放记录，数量按剩余
-  允许范围截断，重复申请不会双重抵消。
+   `occurred / unconfirmed / not_occurred`；已确认的补偿再次申请只会重放记录，重复申请
+   不会双重抵消。**超出剩余批准范围的请求在执行任何外部动作之前被拒绝**
+   （`CompensationError`），绝不会只裁剪内部记录来伪装符合批准——批准边界与实际外部
+   数量始终一致。
+- 回执丢失的尝试进入 `unconfirmed`，其数量作为 `quantity_pending` **保留在批准额度内**：
+   重试不会重复消耗同一批准，也不会直接判定未发生；`quantity_remaining =
+   quantity_allowed - quantity_compensated - quantity_pending` 才是可继续执行余额。
 - `verify_compensation(step, name, occurred, ...)` 处理迟到的补偿回执；重复确认只追加审计
-  记录，已补偿数量不增加。原效果在部分补偿后被重新核实，也不影响补偿进度。
+   记录，已补偿数量不增加。确认时按该次尝试保留的数量入账（可用 `quantity=` 确认
+   部分成功，其余释放）；确认失败则释放保留数量。每次尝试的数量依据与每次人工核实
+   结论都作为追加审计事件保留。原效果在部分补偿后被重新核实，也不影响补偿进度。
 - 没有 `occurred` 证据的效果不能登记或执行补偿（`UnconfirmedEffectError`）。
 - `log.compensation(step, name)` 返回目标效果、决定、允许范围与已补偿数量；
   `log.continuation(step)` 按声明顺序报告哪些相互依赖的效果可以继续、哪些仍与外部
@@ -172,7 +179,9 @@ branch.restore_branch(model, optimizer=opt)  # 只恢复参数/清空梯度/重�
 ```
 
 只能从 `complete` 的检查点建分支。新分支继承真实发生的外部事实（`occurred` 的原效果
-与已确认补偿），但不继承另一分支尚未获确认的补偿决定。恢复只写参数数据、清空梯度并
+与已确认补偿），也继承未确认补偿尝试的**保留数量**（待核对，不是新决定），但不继承另
+一分支尚未获确认的补偿决定本身。分支上重新登记补偿决定时，从继承的已确认/保留数量
+继续同一批准，因此并发分支不会重复消耗同一批准额度。恢复只写参数数据、清空梯度并
 重置优化器动量/矩估计，不执行任何参数更新，因此处理补偿不会重复应用一次更新。
 
 ## 正确性验证
