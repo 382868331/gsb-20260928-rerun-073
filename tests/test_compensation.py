@@ -86,8 +86,14 @@ def test_run_compensation_is_idempotent_and_scoped(tmp_path):
     assert rec["quantity_allowed"] == 3.0
     assert rec["target"].endswith(":effect:register")
 
-    # quantity is clamped to the remaining scope: no double offset
-    log.run_compensation(0, "register", lambda: calls.append(1) or {"offset": 2}, quantity=5.0)
+    # a request beyond the remaining approved balance is refused before any
+    # external action: the ledger may not be trimmed to fake compliance
+    with pytest.raises(ad.CompensationError):
+        log.run_compensation(0, "register", lambda: calls.append(1) or {"offset": 2}, quantity=5.0)
+    assert calls == [1]
+    assert log.compensation(0, "register")["quantity_compensated"] == 2.0
+    # requesting exactly the remaining balance executes and reconciles
+    log.run_compensation(0, "register", lambda: calls.append(1) or {"offset": 2}, quantity=1.0)
     assert log.compensation(0, "register")["quantity_compensated"] == 3.0
     # fully compensated: repeated applications replay, never re-apply
     again = log.run_compensation(0, "register", lambda: calls.append(1) or {"offset": 3})
@@ -277,3 +283,169 @@ def test_random_compute_and_multiple_backwards_around_compensation(tmp_path):
     step = reopened.resume_step(0)
     again = step.run_effect("batch", replay=lambda p: tensor(np.random.default_rng(p["seed"]).standard_normal((4, 4))))
     assert np.allclose(again.data, batch.data)
+
+
+# ------------------------------------------------------- approval boundary
+def test_over_approval_request_is_rejected_not_trimmed(tmp_path):
+    log = ad.TrainingEventLog(tmp_path / "log.jsonl")
+    run_completed_step(log, 0, effects=["register"])
+    log.decide_compensation(0, "register", "compensate", quantity=5.0)
+
+    external = []
+    log.run_compensation(0, "register", lambda: external.append(3.0) or {"offset": 3}, quantity=3.0)
+    # approved 5, already compensated 3: requesting 4 must be refused before
+    # any external action, not silently trimmed to 2 in the ledger only
+    with pytest.raises(ad.CompensationError):
+        log.run_compensation(0, "register", lambda: external.append(4.0) or {"offset": 4}, quantity=4.0)
+    assert external == [3.0]
+    rec = log.compensation(0, "register")
+    assert rec["quantity_compensated"] == 3.0
+    assert rec["quantity_pending"] == 0.0
+    # exactly the remaining balance still executes
+    log.run_compensation(0, "register", lambda: external.append(2.0) or {"offset": 2}, quantity=2.0)
+    assert external == [3.0, 2.0]
+    assert log.compensation(0, "register")["quantity_compensated"] == 5.0
+    # approval exhausted: nothing more may leave the process
+    with pytest.raises(ad.CompensationError):
+        log.run_compensation(0, "register", lambda: external.append(1.0), quantity=1.0)
+    assert external == [3.0, 2.0]
+
+
+def test_lost_receipt_holds_pending_and_late_receipt_settles(tmp_path):
+    log = ad.TrainingEventLog(tmp_path / "log.jsonl")
+    run_completed_step(log, 0, effects=["register"])
+    log.decide_compensation(0, "register", "compensate", quantity=5.0)
+    log.run_compensation(0, "register", lambda: {"offset": 3}, quantity=3.0)
+
+    # the external action may have run but the receipt was lost
+    with pytest.raises(ad.ExternalEffectUncertain):
+        log.run_compensation(
+            0, "register",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("receipt lost")),
+            quantity=2.0,
+        )
+    rec = log.compensation(0, "register")
+    assert rec["status"] == "unconfirmed"
+    assert rec["quantity_compensated"] == 3.0
+    assert rec["quantity_pending"] == 2.0
+    # retrying must not consume the same approval again, nor assume nothing happened
+    with pytest.raises(ad.UnconfirmedEffectError):
+        log.run_compensation(0, "register", lambda: {"offset": 2}, quantity=2.0)
+    # the pending amount is reserved: the approval cannot be lowered beneath it
+    with pytest.raises(ad.CompensationError):
+        log.decide_compensation(0, "register", "compensate", quantity=4.0)
+    # a receipt confirming more than was attempted is rejected
+    with pytest.raises(ad.CompensationError):
+        log.verify_compensation(0, "register", True, {"offset": 3}, quantity=3.0)
+    # the late receipt settles exactly the pending amount
+    rec = log.verify_compensation(0, "register", True, {"offset": 2}, note="late receipt")
+    assert rec["quantity_compensated"] == 5.0
+    assert rec["quantity_pending"] == 0.0
+    # a duplicate late receipt is audited but never compensates twice
+    rec = log.verify_compensation(0, "register", True, {"offset": 2}, note="duplicate")
+    assert rec["quantity_compensated"] == 5.0
+    kinds = [e["kind"] for e in log.audit_events(0)]
+    assert kinds.count("compensation_attempt") == 1
+    assert kinds.count("compensation_verification") == 2
+
+
+def test_pending_quantity_survives_reopen(tmp_path):
+    path = tmp_path / "log.jsonl"
+    log = ad.TrainingEventLog(path)
+    run_completed_step(log, 0, effects=["register"])
+    log.decide_compensation(0, "register", "compensate", quantity=4.0)
+    log.run_compensation(0, "register", lambda: {"offset": 1}, quantity=1.0)
+    with pytest.raises(ad.ExternalEffectUncertain):
+        log.run_compensation(
+            0, "register",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("crash after send")),
+            quantity=2.0,
+        )
+
+    reopened = ad.TrainingEventLog(path)
+    rec = reopened.compensation(0, "register")
+    assert rec["quantity_compensated"] == 1.0
+    assert rec["quantity_pending"] == 2.0
+    assert rec["status"] == "unconfirmed"
+    with pytest.raises(ad.UnconfirmedEffectError):
+        reopened.run_compensation(0, "register", lambda: {"offset": 2}, quantity=2.0)
+    # human check: the attempt definitely did not happen; the reservation is
+    # released and only then may the balance be executed again
+    rec = reopened.verify_compensation(0, "register", False, note="provider confirms nothing ran")
+    assert rec["quantity_pending"] == 0.0
+    assert rec["quantity_compensated"] == 1.0
+    external = []
+    reopened.run_compensation(0, "register", lambda: external.append(2.0) or {"offset": 2}, quantity=2.0)
+    assert external == [2.0]
+    assert reopened.compensation(0, "register")["quantity_compensated"] == 3.0
+
+
+def test_two_concurrent_branches_reconcile_against_inherited_facts(tmp_path):
+    main = ad.TrainingEventLog(tmp_path / "main.jsonl")
+    run_completed_step(main, 0, effects=["register"])
+    main.decide_compensation(0, "register", "compensate", quantity=3.0)
+    main.run_compensation(0, "register", lambda: {"offset": 1}, quantity=1.0)
+
+    branch_a = main.create_branch("a", 0, tmp_path / "a.jsonl")
+    branch_b = main.create_branch("b", 0, tmp_path / "b.jsonl")
+
+    for branch in (branch_a, branch_b):
+        # the inherited confirmed compensation consumes part of the approval
+        rec = branch.decide_compensation(0, "register", "compensate", quantity=3.0)
+        assert rec["quantity_compensated"] == 1.0
+        # requesting the full approval again would reuse it: refused
+        with pytest.raises(ad.CompensationError):
+            branch.run_compensation(0, "register", lambda: {"offset": 3}, quantity=3.0)
+
+    # branch A settles its remaining balance directly
+    branch_a.run_compensation(0, "register", lambda: {"offset": 2}, quantity=2.0)
+    assert branch_a.compensation(0, "register")["quantity_compensated"] == 3.0
+
+    # branch B interleaves a lost receipt and its late arrival
+    with pytest.raises(ad.ExternalEffectUncertain):
+        branch_b.run_compensation(
+            0, "register",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("no ack")),
+            quantity=2.0,
+        )
+    with pytest.raises(ad.UnconfirmedEffectError):
+        branch_b.run_compensation(0, "register", lambda: {"offset": 2}, quantity=2.0)
+    rec = branch_b.verify_compensation(0, "register", True, {"offset": 2}, note="late receipt")
+    assert rec["quantity_compensated"] == 3.0
+    assert rec["quantity_pending"] == 0.0
+    # each branch reconciles: inherited 1 + own 2 = approved 3, never more
+    for branch in (branch_a, branch_b):
+        rec = branch.compensation(0, "register")
+        assert rec["quantity_compensated"] == 3.0
+        assert rec["quantity_allowed"] == 3.0
+
+
+def test_partial_verification_preserves_facts_and_attempt_basis(tmp_path):
+    log = ad.TrainingEventLog(tmp_path / "log.jsonl")
+    run_completed_step(log, 0, effects=["register"])
+    log.decide_compensation(0, "register", "compensate", quantity=5.0)
+    with pytest.raises(ad.ExternalEffectUncertain):
+        log.run_compensation(
+            0, "register",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("timeout")),
+            quantity=4.0,
+        )
+    # human confirms only part of the attempt actually happened
+    rec = log.verify_compensation(0, "register", True, {"offset": 1.5}, quantity=1.5, note="partial: 1.5 of 4")
+    assert rec["quantity_compensated"] == 1.5
+    assert rec["quantity_pending"] == 2.5
+    assert rec["status"] == "unconfirmed"
+    # the rest is later confirmed as not having happened: reservation released
+    rec = log.verify_compensation(0, "register", False, note="remainder never ran")
+    assert rec["quantity_pending"] == 0.0
+    assert rec["quantity_compensated"] == 1.5
+    # the original fact and every attempt/verification stay on record
+    assert log.effect_statuses(0)["register"] == "occurred"
+    audits = [e for e in log.audit_events(0) if e["kind"].startswith("compensation_")]
+    quantities = [e["payload"].get("quantity") for e in audits]
+    assert 4.0 in quantities and 1.5 in quantities
+    notes = [e["payload"].get("note", "") for e in audits]
+    assert any("partial" in n for n in notes) and any("remainder" in n for n in notes)
+    # the released balance is executable again, up to the approval boundary
+    log.run_compensation(0, "register", lambda: {"offset": 3.5}, quantity=3.5)
+    assert log.compensation(0, "register")["quantity_compensated"] == 5.0

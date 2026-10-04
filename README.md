@@ -155,10 +155,17 @@ log.decide_compensation(step, "publish", "pending")                  # 仍等待
 ```
 
 - `run_compensation(step, name, apply, replay, quantity=...)` 执行抵消效果，本身也会落入
-  `occurred / unconfirmed / not_occurred`；已确认的补偿再次申请只会重放记录，数量按剩余
-  允许范围截断，重复申请不会双重抵消。
-- `verify_compensation(step, name, occurred, ...)` 处理迟到的补偿回执；重复确认只追加审计
-  记录，已补偿数量不增加。原效果在部分补偿后被重新核实，也不影响补偿进度。
+  `occurred / unconfirmed / not_occurred`；已确认的补偿再次申请只会重放记录，重复申请
+  不会双重抵消。请求数量超过剩余批准余额（批准 − 已确认 − 待核对）时在执行任何外部
+  动作前抛出 `CompensationError`，绝不通过只裁剪内部记录来伪装符合批准。
+- 回执丢失的不确定尝试会把数量记入 `quantity_pending`（保留待核对）：余额被预留，
+  重试被拒绝（`UnconfirmedEffectError`），批准额度也不能降到已确认加待核对之下；
+  既不会重复消耗同一批准，也不会直接当作未发生。
+- `verify_compensation(step, name, occurred, ...)` 处理迟到的补偿回执；确认数量只能来自
+  待核对余额，超出尝试数量或批准余额都会被拒绝。部分成功只结算已确认部分，剩余待核对
+  数量保留；核实为未发生才释放预留。重复确认只追加审计记录，已补偿数量不增加。每次
+  尝试与核实（含数量、理由、备注）都作为追加审计事件保留，原效果在部分补偿后被重新
+  核实，也不影响补偿进度。
 - 没有 `occurred` 证据的效果不能登记或执行补偿（`UnconfirmedEffectError`）。
 - `log.compensation(step, name)` 返回目标效果、决定、允许范围与已补偿数量；
   `log.continuation(step)` 按声明顺序报告哪些相互依赖的效果可以继续、哪些仍与外部
