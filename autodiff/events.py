@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable
 
 
@@ -55,6 +56,19 @@ class CompensationError(TrainingStepError):
     """Raised when a compensation arrangement is inconsistent with the facts."""
 
 
+class _CompensationReplay(Exception):
+    """Internal: no allowance remains, replay the stored receipt."""
+
+    def __init__(self, payload: Any, replay: Callable[[Any], Any] | None):
+        self.payload = payload
+        self.replay = replay
+
+
+def _quantity_exceeds(requested: float, available: float) -> bool:
+    """Strict comparison with tolerance for floating-point quantity ledgers."""
+    return float(requested) > float(available) + 1e-9
+
+
 def _json_default(value: Any):
     import numpy as np
     if isinstance(value, np.ndarray):
@@ -89,6 +103,7 @@ class TrainingEventLog:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._history: list[dict[str, Any]] = []
+        self._lock = RLock()
         self._events = self._load_unlocked()
 
     @property
@@ -119,18 +134,19 @@ class TrainingEventLog:
         return self._append_event(event, overwrite=kind != "user")
 
     def _append_event(self, event: dict[str, Any], *, overwrite: bool = False) -> dict[str, Any]:
-        event = deepcopy(event)
-        event_id = event["id"]
-        if event_id in self._events and not overwrite:
-            raise EventExistsError(f"training event {event_id!r} is already committed")
-        encoded = json.dumps(event, ensure_ascii=False, sort_keys=True, default=_json_default)
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(encoded + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        self._history.append(deepcopy(event))
-        self._events[event_id] = event
-        return event
+        with self._lock:
+            event = deepcopy(event)
+            event_id = event["id"]
+            if event_id in self._events and not overwrite:
+                raise EventExistsError(f"training event {event_id!r} is already committed")
+            encoded = json.dumps(event, ensure_ascii=False, sort_keys=True, default=_json_default)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(encoded + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            self._history.append(deepcopy(event))
+            self._events[event_id] = event
+            return event
 
     def append(
         self,
@@ -251,6 +267,8 @@ class TrainingEventLog:
         return tuple(deepcopy(e) for e in self._history if e["id"] == step_key or e["id"].startswith(prefix))
 
     # ----------------------------------------------------- compensation
+    DEFAULT_COMPENSATION_TARGET = "default"
+
     @staticmethod
     def _comp_key(step_id: str | int, effect_name: str) -> str:
         return f"{TrainingStep._effect_key(step_id, effect_name)}:compensation"
@@ -262,15 +280,124 @@ class TrainingEventLog:
                 f"no compensation arrangement for effect {effect_name!r} of step {step_id!r}; "
                 "call decide_compensation first"
             )
-        record = deepcopy(self._events[key]["payload"])
+        return self._normalize_compensation_record(deepcopy(self._events[key]["payload"]))
+
+    def _normalize_compensation_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        record.setdefault("revision", 0)
         record.setdefault("quantity_pending", 0.0)
+        allocations = record.get("allocations")
+        if allocations is None:
+            # records written before multiple payees existed: their single
+            # scope becomes the default payee so every quantity is preserved
+            allocation = {
+                "target": self.DEFAULT_COMPENSATION_TARGET,
+                "quantity_allowed": float(record.get("quantity_allowed", 0.0)),
+                "quantity_compensated": float(record.get("quantity_compensated", 0.0)),
+                "quantity_pending": float(record.get("quantity_pending", 0.0)),
+                "status": record.get("status", "not_started"),
+                "payload": record.get("payload"),
+                "reason": record.get("reason"),
+                "attempts": [],
+            }
+            legacy_allocations = [allocation] if (
+                allocation["quantity_allowed"] > 0
+                or allocation["quantity_compensated"] > 0
+                or allocation["quantity_pending"] > 0
+            ) else []
+            record["allocations"] = legacy_allocations
+        for allocation in record.get("allocations", []):
+            attempts = allocation.setdefault("attempts", [])
+            if allocation.get("quantity_pending", 0.0) and not attempts:
+                # record predates per-attempt reservations
+                attempts.append({
+                    "id": f"legacy:{allocation['target']}",
+                    "quantity": float(allocation["quantity_pending"]),
+                    "status": "unconfirmed",
+                    "payload": None,
+                })
+        self._refresh_compensation_totals(record)
+        return record
+
+    @staticmethod
+    def _allocation_index(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {str(a["target"]): a for a in record.get("allocations", [])}
+
+    def _refresh_compensation_totals(self, record: dict[str, Any]) -> dict[str, Any]:
+        allocations = record.setdefault("allocations", [])
+        compensated = sum(float(a.get("quantity_compensated", 0.0)) for a in allocations)
+        pending = sum(
+            float(t.get("quantity", 0.0))
+            for a in allocations for t in a.get("attempts", [])
+            if t.get("status") == "unconfirmed"
+        )
+        allocated = sum(float(a.get("quantity_allowed", 0.0)) for a in allocations)
+        allowed = float(record.get("quantity_allowed", allocated))
+        if _quantity_exceeds(allocated, allowed):
+            # the per-payee view must never promise more than the total approval
+            raise CompensationError(
+                f"allocated quantity {allocated} exceeds the approved quantity {allowed} "
+                f"for effect {record.get('name')!r}"
+            )
+        record["quantity_allowed"] = allowed
+        record["quantity_compensated"] = compensated
+        record["quantity_pending"] = pending
+        record["quantity_allocated"] = allocated
+        record["quantity_unallocated"] = allowed - allocated
+        statuses: set[str] = set()
+        for allocation in allocations:
+            attempt_statuses = {str(t.get("status")) for t in allocation.get("attempts", [])}
+            if "unconfirmed" in attempt_statuses:
+                allocation["status"] = "unconfirmed"
+            elif "not_occurred" in attempt_statuses and "occurred" not in attempt_statuses:
+                allocation["status"] = "not_occurred"
+            elif float(allocation.get("quantity_compensated", 0.0)) > 0:
+                allocation["status"] = "occurred"
+            else:
+                allocation["status"] = "not_started"
+            statuses.add(allocation["status"])
+            allocation["quantity_pending"] = sum(
+                float(t.get("quantity", 0.0)) for t in allocation.get("attempts", [])
+                if t.get("status") == "unconfirmed"
+            )
+        if "unconfirmed" in statuses:
+            status = "unconfirmed"
+        elif compensated > 0:
+            status = "occurred"
+        elif statuses == {"not_occurred"}:
+            status = "not_occurred"
+        elif statuses:
+            status = "not_occurred" if statuses <= {"not_occurred", "not_started"} and "not_occurred" in statuses else "not_started"
+        else:
+            status = "not_started"
+        record["status"] = status
+        for allocation in allocations:
+            allocation["quantity_remaining"] = (
+                float(allocation["quantity_allowed"])
+                - float(allocation.get("quantity_compensated", 0.0))
+                - float(allocation.get("quantity_pending", 0.0))
+            )
         return record
 
     def _write_compensation(self, record: dict[str, Any]) -> dict[str, Any]:
-        return self.append(
-            self._comp_key(record["step"], record["name"]), record,
-            kind="compensation", phase="training", overwrite=True,
+        return self._write_compensation_cas(record, None)
+
+    def _write_compensation_cas(self, record: dict[str, Any], expected_revision: int | None) -> dict[str, Any]:
+        """Persist the ledger state, refusing lost updates from parallel workers."""
+        key = self._comp_key(record["step"], record["name"])
+        current = self._events.get(key)
+        current_revision = int(self._normalize_compensation_record(deepcopy(current["payload"]))["revision"]) if current else 0
+        if expected_revision is not None:
+            if current_revision != expected_revision:
+                raise CompensationError(
+                    f"compensation ledger for effect {record['name']!r} changed concurrently; "
+                    "re-read the payee allowance and retry the settlement"
+                )
+        self._refresh_compensation_totals(record)
+        record["revision"] = current_revision + 1
+        written = self.append(
+            key, record, kind="compensation", phase="training", overwrite=True,
         )
+        return written
 
     def _append_compensation_audit(self, record: dict[str, Any], action: str, note: str, extra: dict[str, Any]) -> None:
         key = self._comp_key(record["step"], record["name"])
@@ -283,6 +410,8 @@ class TrainingEventLog:
             "quantity_allowed": record["quantity_allowed"],
             "quantity_compensated": record["quantity_compensated"],
             "quantity_pending": record.get("quantity_pending", 0.0),
+            "quantity_allocated": record.get("quantity_allocated", 0.0),
+            "quantity_unallocated": record.get("quantity_unallocated", 0.0),
             "note": note,
         }
         payload.update(extra)
@@ -321,8 +450,7 @@ class TrainingEventLog:
             )
         key = self._comp_key(step_id, name)
         if key in self._events:
-            record = deepcopy(self._events[key]["payload"])
-            record.setdefault("quantity_pending", 0.0)
+            record = self._compensation_record(step_id, name)
             if record["status"] == "occurred" and record["decision"] != decision:
                 raise EventExistsError(
                     f"compensation for effect {name!r} already executed; the decision is locked"
@@ -330,29 +458,254 @@ class TrainingEventLog:
             record["decision"] = decision
             if quantity is not None:
                 committed = record["quantity_compensated"] + record["quantity_pending"]
-                if float(quantity) < committed:
+                if float(quantity) + 1e-9 < committed:
                     raise CompensationError(
                         "allowed quantity cannot be below the already compensated "
                         "or still unconfirmed amount"
                     )
                 record["quantity_allowed"] = float(quantity)
+                # already granted per-payee allowances are commitments; only
+                # the still-unallocated part may shrink without an explicit
+                # withdrawal/reallocation
+                if _quantity_exceeds(record["quantity_allocated"], float(quantity)):
+                    raise CompensationError(
+                        "allowed quantity cannot be below the amount already "
+                        "allocated to independent payees; withdraw or transfer "
+                        "those allowances explicitly first"
+                    )
         else:
-            inherited = self._inherited_compensated_quantity(step_id, name)
+            inherited_by_target = self._inherited_compensation_by_target(step_id, name)
+            inherited = sum(inherited_by_target.values())
+            allowed = 1.0 if quantity is None else float(quantity)
+            allocations: list[dict[str, Any]] = []
+            for inherited_target, inherited_quantity in inherited_by_target.items():
+                allocation = self._new_allocation(inherited_target, inherited_quantity)
+                allocation["quantity_compensated"] = inherited_quantity
+                allocation["quantity_remaining"] = 0.0
+                allocation["status"] = "occurred"
+                allocations.append(allocation)
+            # the inherited payee's allowance is topped up to the approved
+            # scope, so the same payee can receive the remaining balance
+            if allocations and len(allocations) == 1:
+                allocations[0]["quantity_allowed"] = allowed
+                allocated_total = allowed
+            else:
+                allocated_total = inherited
             record = {
                 "step": step_id,
                 "name": name,
                 "target": TrainingStep._effect_key(step_id, name),
                 "decision": decision,
                 "status": "occurred" if inherited > 0 else "not_started",
-                "quantity_allowed": 1.0 if quantity is None else float(quantity),
+                "quantity_allowed": allowed,
                 "quantity_compensated": inherited,
                 "quantity_pending": 0.0,
+                "quantity_allocated": allocated_total,
+                "quantity_unallocated": allowed - allocated_total,
+                "allocations": allocations,
                 "payload": None,
                 "reason": None,
             }
         self._write_compensation(record)
         self._append_compensation_audit(record, "decision", note, {})
         return deepcopy(record)
+
+    def _new_allocation(self, target: str, quantity: float) -> dict[str, Any]:
+        return {
+            "target": str(target),
+            "quantity_allowed": float(quantity),
+            "quantity_compensated": 0.0,
+            "quantity_pending": 0.0,
+            "quantity_remaining": float(quantity),
+            "status": "not_started",
+            "payload": None,
+            "reason": None,
+            "attempts": [],
+        }
+
+    def allocate_compensation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        target: str,
+        quantity: float,
+        *,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Grant part of the total approval to one independent external payee.
+
+        Only the still-unallocated part of the approval can be granted.
+        Granting more to an existing payee tops up its allowance; it never
+        creates a second quota for the same payee.
+        """
+        target = str(target)
+        quantity = float(quantity)
+        if quantity < 0:
+            raise CompensationError("allocated quantity must be non-negative")
+        with self._lock:
+            record = self._compensation_record(step_id, effect_name)
+            if record["decision"] != "compensate":
+                raise CompensationError(
+                    f"effect {effect_name!r} is decided as {record['decision']!r}; "
+                    "only compensating effects can allocate payee allowances"
+                )
+            allocations = self._allocation_index(record)
+            if target not in allocations and _quantity_exceeds(quantity, record["quantity_unallocated"]):
+                raise CompensationError(
+                    f"cannot allocate {quantity} to payee {target!r}: only "
+                    f"{record['quantity_unallocated']} of the total approval is unallocated"
+                )
+            if target in allocations and _quantity_exceeds(quantity, record["quantity_unallocated"]):
+                raise CompensationError(
+                    f"cannot top up payee {target!r} by {quantity}: only "
+                    f"{record['quantity_unallocated']} of the total approval is unallocated"
+                )
+            if target in allocations:
+                allocations[target]["quantity_allowed"] += quantity
+            elif quantity > 0:
+                record["allocations"].append(self._new_allocation(target, quantity))
+            self._write_compensation(record)
+            self._append_compensation_audit(
+                record, "allocation", note, {"target": target, "quantity": quantity}
+            )
+            return deepcopy(record)
+
+    def _releasable_allowance(self, allocation: dict[str, Any]) -> float:
+        return (
+            float(allocation["quantity_allowed"])
+            - float(allocation["quantity_compensated"])
+            - float(allocation["quantity_pending"])
+        )
+
+    def withdraw_compensation_allocation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        target: str,
+        quantity: float,
+        *,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Pull an unexecuted payee allowance back to the unallocated pool.
+
+        Confirmed and still-unconfirmed (in-flight) quantities can never be
+        withdrawn: a sent-but-unacknowledged action keeps reserving the
+        original payee's quota until its late receipt is resolved.
+        """
+        target = str(target)
+        quantity = float(quantity)
+        if quantity < 0:
+            raise CompensationError("withdrawn quantity must be non-negative")
+        with self._lock:
+            record = self._compensation_record(step_id, effect_name)
+            allocation = self._allocation_index(record).get(target)
+            if allocation is None:
+                raise KeyError(f"payee {target!r} has no allocation for effect {effect_name!r}")
+            available = self._releasable_allowance(allocation)
+            if _quantity_exceeds(quantity, available):
+                raise CompensationError(
+                    f"cannot withdraw {quantity} from payee {target!r}: only {available} is "
+                    "unexecuted; confirmed and in-flight quantities stay reserved"
+                )
+            allocation["quantity_allowed"] -= quantity
+            self._write_compensation(record)
+            self._append_compensation_audit(
+                record, "withdrawal", note, {"target": target, "quantity": quantity}
+            )
+            return deepcopy(record)
+
+    def reallocate_compensation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        source_target: str,
+        destination_target: str,
+        quantity: float,
+        *,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Move an unexecuted allowance from one payee to another payee.
+
+        The transfer is an explicit allocation change. In-flight, still
+        unconfirmed quantities are not movable, so a late receipt for the
+        original payee can never be charged to the new owner.
+        """
+        source_target = str(source_target)
+        destination_target = str(destination_target)
+        quantity = float(quantity)
+        if quantity < 0:
+            raise CompensationError("transferred quantity must be non-negative")
+        if source_target == destination_target:
+            raise CompensationError("source and destination payees must differ")
+        with self._lock:
+            record = self._compensation_record(step_id, effect_name)
+            allocations = self._allocation_index(record)
+            source = allocations.get(source_target)
+            if source is None:
+                raise KeyError(
+                    f"payee {source_target!r} has no allocation for effect {effect_name!r}"
+                )
+            available = self._releasable_allowance(source)
+            if _quantity_exceeds(quantity, available):
+                raise CompensationError(
+                    f"cannot transfer {quantity} from payee {source_target!r}: only {available} "
+                    "is unexecuted; in-flight quantities stay reserved against the original payee"
+                )
+            source["quantity_allowed"] -= quantity
+            if destination_target in allocations:
+                allocations[destination_target]["quantity_allowed"] += quantity
+            else:
+                record["allocations"].append(self._new_allocation(destination_target, quantity))
+            self._write_compensation(record)
+            self._append_compensation_audit(
+                record, "reallocation", note,
+                {"source": source_target, "destination": destination_target, "quantity": quantity},
+            )
+            return deepcopy(record)
+
+    def compensation_reallocation_options(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        source_target: str,
+    ) -> dict[str, Any]:
+        """Compare keep / withdraw / transfer plans without any external action.
+
+        Every figure describes a hypothetical plan; calling this method does
+        not change any allowance and sends nothing to an external system.
+        """
+        source_target = str(source_target)
+        with self._lock:
+            record = self._compensation_record(step_id, effect_name)
+            allocations = self._allocation_index(record)
+            source = allocations.get(source_target)
+            if source is None:
+                raise KeyError(
+                    f"payee {source_target!r} has no allocation for effect {effect_name!r}"
+                )
+            releasable = self._releasable_allowance(source)
+            plans: list[dict[str, Any]] = []
+            for destination, allocation in allocations.items():
+                if destination == source_target:
+                    continue
+                plan = {
+                    "target": destination,
+                    "quantity_transferable": releasable,
+                    source_target: source["quantity_allowed"] - releasable,
+                    destination: allocation["quantity_allowed"] + releasable,
+                }
+                plans.append(plan)
+            return {
+                "step": str(step_id),
+                "name": str(effect_name),
+                "keep": {"target": source_target, "quantity_available": releasable},
+                "withdraw": {
+                    "target": source_target,
+                    "quantity_released": releasable,
+                    "quantity_unallocated_after": record["quantity_unallocated"] + releasable,
+                },
+                "transfer": plans,
+            }
 
     def compensation(self, step_id: str | int, effect_name: str) -> dict[str, Any]:
         """Current compensation record: target, decision, scope and progress."""
@@ -371,16 +724,20 @@ class TrainingEventLog:
                     return str(payload.get("status"))
         return None
 
-    def _inherited_compensated_quantity(self, step_id: str | int, effect_name: str) -> float:
+    def _inherited_compensation_by_target(self, step_id: str | int, effect_name: str) -> dict[str, float]:
         step_id = str(step_id)
         name = str(effect_name)
-        total = 0.0
+        totals: dict[str, float] = {}
         for event in self._events.values():
             if event.get("kind") == "inherited_compensation":
                 payload = event["payload"]
                 if payload.get("step") == step_id and payload.get("name") == name:
-                    total += float(payload.get("quantity_compensated", 0.0))
-        return total
+                    target = str(payload.get("target", self.DEFAULT_COMPENSATION_TARGET))
+                    totals[target] = totals.get(target, 0.0) + float(payload.get("quantity_compensated", 0.0))
+        return totals
+
+    def _inherited_compensated_quantity(self, step_id: str | int, effect_name: str) -> float:
+        return sum(self._inherited_compensation_by_target(step_id, effect_name).values())
 
     def compensations(self, step_id: str | int) -> dict[str, dict[str, Any]]:
         prefix = f"{TrainingStep._step_key(step_id)}:effect:"
@@ -398,88 +755,177 @@ class TrainingEventLog:
         replay: Callable[[Any], Any] | None = None,
         *,
         quantity: float | None = None,
+        target: str | None = None,
+        replay_only: bool = False,
     ) -> Any:
         """Execute the compensating effect once, within the allowed scope.
 
-        Idempotent: an already confirmed compensation is replayed, never
-        re-applied; quantities are clamped to the remaining allowed scope so
-        duplicate requests cannot double-offset the original fact.
+        The request is charged against one independent payee's allowance.
+        Idempotent: an already completed payee request is replayed, never
+        re-applied; other payees' unused allowances are never touched.
         """
         step_id = str(step_id)
         name = str(effect_name)
-        record = self._compensation_record(step_id, name)
-        if record["decision"] != "compensate":
-            raise CompensationError(
-                f"effect {name!r} is decided as {record['decision']!r}, not 'compensate'"
+        target_name = self.DEFAULT_COMPENSATION_TARGET if target is None else str(target)
+        try:
+            attempt_id, qty = self._reserve_compensation(
+                step_id, name, target_name, None if replay_only else quantity,
+                apply is None, replay,
             )
-        effect_status = self._effect_status_with_inheritance(step_id, name)
-        if effect_status != "occurred":
-            raise UnconfirmedEffectError(
-                f"effect {name!r} of step {step_id!r} is {effect_status}; without evidence "
-                "that the original effect occurred no compensation may execute"
-            )
-        remaining = (
-            record["quantity_allowed"]
-            - record["quantity_compensated"]
-            - record["quantity_pending"]
-        )
-        if record["status"] == "unconfirmed":
-            raise UnconfirmedEffectError(
-                f"compensation for effect {name!r} is unconfirmed; "
-                "call verify_compensation with the late receipt before retrying"
-            )
-        if quantity is not None and float(quantity) > remaining:
-            raise CompensationError(
-                f"requested compensation quantity {float(quantity)} exceeds the remaining "
-                f"approved balance {remaining} for effect {name!r}; the approval boundary "
-                "cannot be met by trimming only the internal record"
-            )
-        if record["status"] == "occurred" and remaining <= 0:
-            return replay(record["payload"]) if replay is not None else deepcopy(record["payload"])
-        if remaining <= 0:
-            if replay is not None and record["payload"] is not None:
-                return replay(record["payload"])
-            return deepcopy(record["payload"])
-        if apply is None:
-            raise ValueError("apply is required for a compensation that has not completed")
-        qty = remaining if quantity is None else float(quantity)
-        if qty <= 0:
-            raise CompensationError("compensation quantity must be positive")
+        except _CompensationReplay as done:
+            return done.replay(done.payload) if done.replay is not None else deepcopy(done.payload)
         try:
             payload = apply()
         except ExternalEffectUncertain as exc:
-            record["status"] = "unconfirmed"
-            record["reason"] = str(exc)
-            record["quantity_pending"] += qty
-            self._write_compensation(record)
-            self._append_compensation_audit(
-                record, "attempt", str(exc), {"quantity": qty, "outcome": "uncertain"}
-            )
+            self._settle_attempt(step_id, name, target_name, attempt_id, qty, "uncertain", reason=str(exc))
             raise
         except ExternalEffectNotExecuted as exc:
-            record["status"] = "not_occurred"
-            record["reason"] = str(exc)
-            self._write_compensation(record)
-            self._append_compensation_audit(
-                record, "attempt", str(exc), {"quantity": qty, "outcome": "not_occurred"}
-            )
+            self._settle_attempt(step_id, name, target_name, attempt_id, qty, "not_occurred", reason=str(exc))
             raise
         except Exception as exc:
-            record["status"] = "unconfirmed"
-            record["reason"] = repr(exc)
-            record["quantity_pending"] += qty
-            self._write_compensation(record)
-            self._append_compensation_audit(
-                record, "attempt", repr(exc), {"quantity": qty, "outcome": "uncertain"}
-            )
+            self._settle_attempt(step_id, name, target_name, attempt_id, qty, "uncertain", reason=repr(exc))
             raise
-        record["status"] = "occurred"
-        record["payload"] = payload
-        record["reason"] = None
-        record["quantity_compensated"] += qty
-        self._write_compensation(record)
-        self._append_compensation_audit(record, "receipt", "", {"quantity": qty, "payload": deepcopy(payload)})
+        self._settle_attempt(step_id, name, target_name, attempt_id, qty, "occurred", payload=payload)
         return replay(payload) if replay is not None else deepcopy(payload)
+
+    def _reserve_compensation(
+        self,
+        step_id: str,
+        name: str,
+        target_name: str,
+        quantity: float | None,
+        apply_missing: bool,
+        replay: Callable[[Any], Any] | None,
+    ) -> tuple[str, float]:
+        import time
+        for wait_attempt in range(200):
+            wait = False
+            with self._lock:
+                record = self._compensation_record(step_id, name)
+                if record["decision"] != "compensate":
+                    raise CompensationError(
+                        f"effect {name!r} is decided as {record['decision']!r}, not 'compensate'"
+                    )
+                effect_status = self._effect_status_with_inheritance(step_id, name)
+                if effect_status != "occurred":
+                    raise UnconfirmedEffectError(
+                        f"effect {name!r} of step {step_id!r} is {effect_status}; without evidence "
+                        "that the original effect occurred no compensation may execute"
+                    )
+                allocations = self._allocation_index(record)
+                allocation = allocations.get(target_name)
+                if allocation is None and target_name == self.DEFAULT_COMPENSATION_TARGET and not record["allocations"]:
+                    allocation = self._new_allocation(target_name, record["quantity_allowed"])
+                    record["allocations"].append(allocation)
+                if allocation is None:
+                    raise CompensationError(
+                        f"payee {target_name!r} has no allowance for effect {name!r}; "
+                        "call allocate_compensation first"
+                    )
+                remaining = self._releasable_allowance(allocation)
+                qty = remaining if quantity is None else float(quantity)
+                in_flight = any(t["status"] == "unconfirmed" for t in allocation.get("attempts", []))
+                if remaining <= 0 and in_flight and quantity is not None and wait_attempt < 199:
+                    # peers are applying externally: wait for their receipts,
+                    # then re-read instead of assuming success or failure
+                    wait = True
+                elif remaining <= 0 and in_flight:
+                    raise UnconfirmedEffectError(
+                        f"compensation for payee {target_name!r} is unconfirmed and no balance "
+                        "remains unreserved; settle the late receipt first"
+                    )
+                elif remaining <= 0 and quantity is not None and float(quantity) > 0:
+                    raise CompensationError(
+                        f"payee {target_name!r} has no remaining approved balance; an explicit "
+                        "new request cannot be satisfied, use a replay call"
+                    )
+                elif remaining <= 0:
+                    raise _CompensationReplay(allocation["payload"], replay)
+                else:
+                    if apply_missing:
+                        raise ValueError("apply is required for a compensation that has not completed")
+                    if qty <= 0:
+                        raise CompensationError("compensation quantity must be positive")
+                    if in_flight and _quantity_exceeds(qty, remaining):
+                        raise UnconfirmedEffectError(
+                            f"compensation for payee {target_name!r} has an in-flight attempt; "
+                            "call verify_compensation with the late receipt before requesting "
+                            "more than the still-unreserved balance"
+                        )
+                    if not in_flight and _quantity_exceeds(qty, remaining):
+                        raise CompensationError(
+                            f"requested compensation quantity {float(quantity)} exceeds the remaining "
+                            f"approved balance {remaining} for payee {target_name!r}; other payees' "
+                            "allowances cannot be spent without an explicit reallocation"
+                        )
+                    attempt_id = (
+                        f"{step_id}:{name}:{target_name}:attempt:{len(allocation['attempts'])}"
+                    )
+                    allocation["attempts"].append(
+                        {"id": attempt_id, "quantity": qty, "status": "unconfirmed", "payload": None}
+                    )
+                    revision = int(record.get("revision", 0))
+                    try:
+                        self._write_compensation_cas(record, revision)
+                    except CompensationError:
+                        continue
+                    self.append(
+                        f"compensation-reservation:{attempt_id}",
+                        {"step": step_id, "name": name, "target": target_name,
+                         "quantity": qty, "attempt_id": attempt_id},
+                        kind="compensation_reservation", phase="training",
+                    )
+                    return attempt_id, qty
+            if wait:
+                time.sleep(0.01)
+        raise UnconfirmedEffectError(
+            f"timed out waiting for in-flight compensation of payee {target_name!r}"
+        )
+
+    def _settle_attempt(
+        self,
+        step_id: str,
+        name: str,
+        target_name: str,
+        attempt_id: str,
+        qty: float,
+        outcome: str,
+        *,
+        payload: Any = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        while True:
+            with self._lock:
+                record = self._compensation_record(step_id, name)
+                allocation = self._allocation_index(record)[target_name]
+                attempts = allocation["attempts"]
+                attempt = next((t for t in attempts if t["id"] == attempt_id), None)
+                if attempt is None or attempt["status"] != "unconfirmed":
+                    return deepcopy(record)
+                revision = int(record.get("revision", 0))
+                if outcome == "occurred":
+                    attempt["status"] = "occurred"
+                    attempt["payload"] = payload
+                    allocation["quantity_compensated"] += qty
+                    allocation["payload"] = payload
+                    allocation["reason"] = None
+                elif outcome == "not_occurred":
+                    attempt["status"] = "not_occurred"
+                    attempt["payload"] = None
+                    allocation["reason"] = reason or None
+                else:
+                    allocation["reason"] = reason or None
+                try:
+                    self._write_compensation_cas(record, revision)
+                except CompensationError:
+                    continue
+                audit_outcome = outcome if outcome != "occurred" else "receipt"
+                self._append_compensation_audit(
+                    record, "attempt" if outcome != "occurred" else "receipt", reason,
+                    {"target": target_name, "quantity": qty, "outcome": outcome,
+                     "attempt_id": attempt_id, "payload": deepcopy(payload)},
+                )
+                return deepcopy(record)
 
     def verify_compensation(
         self,
@@ -489,56 +935,84 @@ class TrainingEventLog:
         payload: Any = None,
         *,
         quantity: float | None = None,
+        target: str | None = None,
         note: str = "",
     ) -> dict[str, Any]:
         """Resolve an unconfirmed compensation from a (possibly late) receipt.
 
-        Confirming an already confirmed compensation only appends an audit
-        record; the compensated quantity never increases twice.
+        The receipt is always settled against the original payee's quota. A
+        duplicate or late receipt only appends an audit record; it is never
+        charged against a payee that received a reallocated allowance.
         """
         step_id = str(step_id)
         name = str(effect_name)
-        record = self._compensation_record(step_id, name)
-        if record["status"] == "occurred":
-            if not occurred:
-                raise EventExistsError(
-                    f"compensation for effect {name!r} was already confirmed; it cannot be revoked"
+        target_name = self.DEFAULT_COMPENSATION_TARGET if target is None else str(target)
+        with self._lock:
+            record = self._compensation_record(step_id, name)
+            allocations = self._allocation_index(record)
+            if target_name not in allocations:
+                raise KeyError(
+                    f"payee {target_name!r} has no allocation for effect {name!r}"
                 )
-            self._append_compensation_audit(record, "verification", note, {"duplicate": True})
-            return deepcopy(record)
-        if record["status"] != "unconfirmed":
-            raise UnconfirmedEffectError(
-                f"compensation for effect {name!r} is {record['status']}; nothing to verify"
+            allocation = allocations[target_name]
+            if allocation["status"] == "occurred" and allocation["quantity_pending"] <= 0:
+                if not occurred:
+                    raise EventExistsError(
+                        f"compensation for payee {target_name!r} was already confirmed; "
+                        "it cannot be revoked"
+                    )
+                self._append_compensation_audit(
+                    record, "verification", note,
+                    {"target": target_name, "duplicate": True},
+                )
+                return deepcopy(record)
+            if allocation["status"] != "unconfirmed":
+                raise UnconfirmedEffectError(
+                    f"compensation for payee {target_name!r} is {allocation['status']}; "
+                    "nothing to verify"
+                )
+            pending_attempts = [t for t in allocation["attempts"] if t["status"] == "unconfirmed"]
+            attempt = pending_attempts[-1]
+            attempt_quantity = float(attempt["quantity"])
+            qty = 0.0
+            if occurred:
+                qty = attempt_quantity if quantity is None else float(quantity)
+                if _quantity_exceeds(qty, attempt_quantity):
+                    raise CompensationError(
+                        f"receipt confirms {qty} but the in-flight attempt for payee "
+                        f"{target_name!r} only reserved {attempt_quantity}; confirming more "
+                        "than was attempted would "
+                        "consume the allowance twice"
+                    )
+                if _quantity_exceeds(qty, allocation["quantity_allowed"] - allocation["quantity_compensated"]):
+                    raise CompensationError(
+                        "confirmed quantity exceeds the payee's remaining allowance; the "
+                        "approval boundary cannot be met by trimming only the internal record"
+                    )
+                allocation["quantity_compensated"] += qty
+                if qty + 1e-9 >= attempt_quantity:
+                    attempt["status"] = "occurred"
+                    attempt["payload"] = payload
+                else:
+                    # partial confirmation: split the reservation so the
+                    # confirmed slice and the still-open slice never overlap
+                    attempt["quantity"] = attempt_quantity - qty
+                    allocation["attempts"].append(
+                        {"id": f"{attempt['id']}:confirmed", "quantity": qty,
+                         "status": "occurred", "payload": payload}
+                    )
+                allocation["payload"] = payload
+                allocation["reason"] = None
+            else:
+                attempt["status"] = "not_occurred"
+                attempt["payload"] = None
+                allocation["reason"] = note or None
+            self._write_compensation(record)
+            self._append_compensation_audit(
+                record, "verification", note,
+                {"target": target_name, "occurred": bool(occurred), "quantity": qty if occurred else 0.0},
             )
-        if occurred:
-            pending = record["quantity_pending"]
-            qty = pending if quantity is None else float(quantity)
-            if qty > pending:
-                raise CompensationError(
-                    f"receipt confirms {qty} but only {pending} of compensation for effect "
-                    f"{name!r} is pending; confirming more than was attempted would "
-                    "consume the approval twice"
-                )
-            if qty > record["quantity_allowed"] - record["quantity_compensated"]:
-                raise CompensationError(
-                    "confirmed quantity exceeds the remaining approved balance; "
-                    "the approval boundary cannot be met by trimming only the internal record"
-                )
-            record["quantity_pending"] -= qty
-            record["quantity_compensated"] += qty
-            record["status"] = "occurred" if record["quantity_pending"] <= 0 else "unconfirmed"
-            record["payload"] = payload
-            record["reason"] = None
-        else:
-            record["quantity_pending"] = 0.0
-            record["status"] = "not_occurred"
-            record["payload"] = None
-        self._write_compensation(record)
-        self._append_compensation_audit(
-            record, "verification", note,
-            {"occurred": bool(occurred), "quantity": qty if occurred else 0.0},
-        )
-        return deepcopy(record)
+            return deepcopy(record)
 
     # ----------------------------------------------------- resolution
     def effect_resolution(self, step_id: str | int, effect_name: str) -> dict[str, Any]:
@@ -644,11 +1118,30 @@ class TrainingEventLog:
                     f"branch:{branch_id}:fact:{key}", deepcopy(event["payload"]),
                     kind="inherited_effect", phase="training",
                 )
-            elif kind == "compensation" and status == "occurred":
-                branch.append(
-                    f"branch:{branch_id}:fact:{key}", deepcopy(event["payload"]),
-                    kind="inherited_compensation", phase="training",
-                )
+            elif kind == "compensation":
+                payload = self._normalize_compensation_record(deepcopy(event["payload"]))
+                for index, allocation in enumerate(payload.get("allocations", [])):
+                    confirmed = float(allocation.get("quantity_compensated", 0.0))
+                    if confirmed <= 0:
+                        # unconfirmed or not-yet-executed payee actions are
+                        # decisions on this branch, not inherited facts
+                        continue
+                    fact = {
+                        "step": payload["step"],
+                        "name": payload["name"],
+                        "target": allocation["target"],
+                        "decision": payload["decision"],
+                        "quantity_allowed": confirmed,
+                        "quantity_compensated": confirmed,
+                        "quantity_pending": 0.0,
+                        "status": "occurred",
+                        "payload": allocation.get("payload"),
+                        "reason": None,
+                    }
+                    branch.append(
+                        f"branch:{branch_id}:fact:{key}:{allocation['target']}:{index}", fact,
+                        kind="inherited_compensation", phase="training",
+                    )
         return branch
 
     def branch_record(self) -> dict[str, Any]:

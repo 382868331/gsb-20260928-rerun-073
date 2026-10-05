@@ -171,6 +171,32 @@ log.decide_compensation(step, "publish", "pending")                  # 仍等待
   `log.continuation(step)` 按声明顺序报告哪些相互依赖的效果可以继续、哪些仍与外部
   事实冲突（部分补偿、未决定、未确认都算冲突并阻断后续效果）。
 
+一次批准可以分配给多个相互独立的外部收款对象，分批执行、分批回执：
+
+```python
+log.allocate_compensation(step, "payout", "alice", 3.0)   # 从总额度中划出对象额度
+log.allocate_compensation(step, "payout", "bob", 2.0)
+log.run_compensation(step, "payout", api.send, target="alice", quantity=1.5)
+log.verify_compensation(step, "payout", True, receipt, target="alice")
+```
+
+- 总额度与对象额度分别可核对：`compensation()` 同时返回 `quantity_allowed`、
+  `quantity_allocated`、`quantity_unallocated` 与每个对象的 `quantity_allowed /
+  quantity_compensated / quantity_pending / quantity_remaining`；所有对象额度之和
+  不能超过总批准。
+- 某对象未用完的额度不会被其他对象自动使用：执行时只校验该对象余额；必须显式
+  `withdraw_compensation_allocation()`（撤回为未分配）或
+  `reallocate_compensation(step, name, src, dst, qty)`（部分/全部转移给另一对象）。
+  `compensation_reallocation_options()` 只计算“维持原分配 / 撤回未执行额度 /
+  转移给其他对象”三种方案的账面结果，不执行任何外部动作。
+- 已发出但回执未确认的数量按尝试（attempt）继续占用**原对象**额度，转移与撤回
+  都会被拒绝；迟到回执始终结算到原尝试/原对象，即使额度之后重新分配也不会在新
+  旧对象之间重复扣记。部分确认只结算已确认部分，核实为未发生才释放预留。
+- 并行补偿使用每进程锁与台账修订号（CAS）：预留先于外部调用落盘，竞态线程重读
+  最新余额后重试，保证总额度不会被重复消费；保存后重开日志，待核对数量、尝试与
+  各对象余额都从 JSONL 恢复。分支只继承各对象**已确认**的补偿事实，不继承未确认
+  尝试。旧版单对象日志会自动归一化为 `default` 对象，历史数量不变。
+
 ### 从检查点建立训练分支
 
 ```python

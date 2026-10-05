@@ -449,3 +449,203 @@ def test_partial_verification_preserves_facts_and_attempt_basis(tmp_path):
     # the released balance is executable again, up to the approval boundary
     log.run_compensation(0, "register", lambda: {"offset": 3.5}, quantity=3.5)
     assert log.compensation(0, "register")["quantity_compensated"] == 5.0
+
+
+# ----------------------------------------- multiple independent payees
+def _multi_payee_log(tmp_path, total=10.0, allocations=("alice", "bob", "carol")):
+    log = ad.TrainingEventLog(tmp_path / "log.jsonl")
+    run_completed_step(log, 0, effects=["payout"])
+    log.decide_compensation(0, "payout", "compensate", quantity=total)
+    for payee in allocations:
+        log.allocate_compensation(0, "payout", payee, float(total) / len(allocations))
+    return log
+
+
+def test_total_and_per_target_approvals_are_separately_reconcilable(tmp_path):
+    log = _multi_payee_log(tmp_path, total=9.0)
+    rec = log.compensation(0, "payout")
+    assert rec["quantity_allowed"] == 9.0
+    assert rec["quantity_allocated"] == 9.0
+    assert rec["quantity_unallocated"] == 0.0
+    targets = {t["target"]: t for t in rec["allocations"]}
+    assert set(targets) == {"alice", "bob", "carol"}
+    for target in targets.values():
+        assert target["quantity_allowed"] == 3.0
+        assert target["quantity_compensated"] == 0.0
+        assert target["quantity_pending"] == 0.0
+
+    # the total approval cannot be over-committed across targets
+    with pytest.raises(ad.CompensationError):
+        log.allocate_compensation(0, "payout", "dave", 1.0)
+    # an existing target is topped up, not duplicated
+    log.withdraw_compensation_allocation(0, "payout", "carol", 1.0)
+    log.allocate_compensation(0, "payout", "dave", 0.5)
+    log.allocate_compensation(0, "payout", "dave", 0.5)
+    rec = log.compensation(0, "payout")
+    assert rec["quantity_allocated"] == 9.0
+    assert rec["quantity_unallocated"] == 0.0
+    dave = next(t for t in rec["allocations"] if t["target"] == "dave")
+    assert dave["quantity_allowed"] == 1.0
+
+    # a target cannot spend beyond its own allowance, even though other
+    # targets still hold unused approval
+    actions = []
+    with pytest.raises(ad.CompensationError):
+        log.run_compensation(0, "payout", lambda: actions.append(4.0) or {"to": "alice"}, target="alice", quantity=4.0)
+    assert actions == []
+    log.run_compensation(0, "payout", lambda: actions.append(2.0) or {"to": "alice"}, target="alice", quantity=2.0)
+    rec = log.compensation(0, "payout")
+    assert rec["quantity_compensated"] == 2.0
+    alice = next(t for t in rec["allocations"] if t["target"] == "alice")
+    assert alice["quantity_compensated"] == 2.0 and alice["quantity_remaining"] == 1.0
+
+
+def test_unused_target_allowance_needs_explicit_reallocation(tmp_path):
+    log = _multi_payee_log(tmp_path, total=9.0)
+    # bob uses part; carol never executes: alice may not silently take it
+    log.run_compensation(0, "payout", lambda: {"to": "bob", "n": 2}, target="bob", quantity=2.0)
+    with pytest.raises(ad.CompensationError):
+        log.run_compensation(0, "payout", lambda: {"to": "alice"}, target="alice", quantity=3.5)
+
+    # options can be compared without performing any external action
+    options = log.compensation_reallocation_options(0, "payout", "carol")
+    assert options["keep"] == {"target": "carol", "quantity_available": 3.0}
+    assert options["withdraw"] == {"target": "carol", "quantity_released": 3.0, "quantity_unallocated_after": 3.0}
+    partial = {m["target"]: m for m in options["transfer"]}
+    assert partial["alice"]["quantity_transferable"] == 3.0
+    assert partial["alice"]["alice"] == 6.0
+    assert partial["alice"]["carol"] == 0.0
+    # carol's own unused allowance is still intact after the comparison
+    assert log.compensation(0, "payout").get("quantity_unallocated", 0.0) == 0.0
+
+    # explicit partial transfer moves only the named amount
+    log.reallocate_compensation(0, "payout", "carol", "alice", 2.0)
+    rec = log.compensation(0, "payout")
+    targets = {t["target"]: t for t in rec["allocations"]}
+    assert targets["carol"]["quantity_allowed"] == 1.0
+    assert targets["alice"]["quantity_allowed"] == 5.0
+    assert rec["quantity_allocated"] == 9.0
+    log.run_compensation(0, "payout", lambda: {"to": "alice"}, target="alice", quantity=3.5)
+    targets = {t["target"]: t for t in log.compensation(0, "payout")["allocations"]}
+    assert targets["alice"]["quantity_compensated"] == 3.5
+    assert targets["carol"]["quantity_compensated"] == 0.0
+
+
+def test_pending_send_holds_source_allowance_and_late_receipt_settles_once(tmp_path):
+    log = _multi_payee_log(tmp_path, total=9.0)
+    # an action to bob was sent but its receipt is unknown: bob's allowance
+    # stays reserved and cannot be given to anyone else meanwhile
+    with pytest.raises(ad.ExternalEffectUncertain):
+        log.run_compensation(
+            0, "payout",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("ack lost")),
+            target="bob", quantity=3.0,
+        )
+    with pytest.raises(ad.CompensationError):
+        log.reallocate_compensation(0, "payout", "bob", "alice", 1.0)
+    with pytest.raises(ad.CompensationError):
+        log.withdraw_compensation_allocation(0, "payout", "bob", 1.0)
+    # other targets remain executable while bob is pending
+    log.run_compensation(0, "payout", lambda: {"to": "alice", "n": 1}, target="alice", quantity=1.0)
+
+    # process restart preserves the reservation
+    reopened = ad.TrainingEventLog(log.path)
+    rec = reopened.compensation(0, "payout")
+    targets = {t["target"]: t for t in rec["allocations"]}
+    assert targets["bob"]["quantity_pending"] == 3.0
+    assert targets["bob"]["quantity_remaining"] == 0.0
+    # late receipt settles the original target only
+    rec = reopened.verify_compensation(0, "payout", True, {"to": "bob", "n": 3}, target="bob")
+    targets = {t["target"]: t for t in rec["allocations"]}
+    assert targets["bob"]["quantity_compensated"] == 3.0
+    assert targets["bob"]["quantity_pending"] == 0.0
+    assert targets["alice"]["quantity_compensated"] == 1.0
+    # a duplicate late receipt must never be booked against another target
+    dup = reopened.verify_compensation(0, "payout", True, {"to": "bob", "n": 3}, target="bob", note="duplicate late")
+    targets = {t["target"]: t for t in dup["allocations"]}
+    assert targets["bob"]["quantity_compensated"] == 3.0
+    assert targets["carol"]["quantity_compensated"] == 0.0
+    assert dup["quantity_compensated"] == 4.0
+    kinds = [e["kind"] for e in reopened.audit_events(0)]
+    assert kinds.count("compensation_verification") == 2
+
+
+def test_reallocation_after_not_occurred_verification_releases_reservation(tmp_path):
+    log = _multi_payee_log(tmp_path, total=9.0)
+    with pytest.raises(ad.ExternalEffectUncertain):
+        log.run_compensation(
+            0, "payout",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("timeout")),
+            target="bob", quantity=2.0,
+        )
+    # human check proves nothing ran externally: the reservation is released
+    rec = log.verify_compensation(0, "payout", False, target="bob", note="provider says nothing ran")
+    targets = {t["target"]: t for t in rec["allocations"]}
+    assert targets["bob"]["quantity_pending"] == 0.0
+    assert targets["bob"]["quantity_remaining"] == 3.0
+    # withdrawal and transfer of the released allowance are now both possible
+    log.reallocate_compensation(0, "payout", "bob", "alice", 2.0)
+    log.withdraw_compensation_allocation(0, "payout", "bob", 1.0)
+    rec = log.compensation(0, "payout")
+    targets = {t["target"]: t for t in rec["allocations"]}
+    assert targets["bob"]["quantity_allowed"] == 0.0
+    assert targets["alice"]["quantity_allowed"] == 5.0
+    assert rec["quantity_unallocated"] == 1.0
+    # the withdrawn slice can be handed out again explicitly
+    log.allocate_compensation(0, "payout", "carol", 1.0)
+    assert log.compensation(0, "payout")["quantity_unallocated"] == 0.0
+
+
+def test_parallel_compensation_never_consumes_total_approval_twice(tmp_path):
+    import threading
+    log = ad.TrainingEventLog(tmp_path / "log.jsonl")
+    run_completed_step(log, 0, effects=["payout"])
+    log.decide_compensation(0, "payout", "compensate", quantity=6.0)
+    log.allocate_compensation(0, "payout", "alice", 6.0)
+
+    sent = []
+    errors = []
+    barrier = threading.Barrier(3)
+
+    def worker():
+        barrier.wait()
+        try:
+            log.run_compensation(
+                0, "payout", lambda: sent.append(2.0) or {"to": "alice", "n": 2},
+                target="alice", quantity=2.0,
+            )
+        except Exception as exc:  # noqa: BLE001 - collect the refused races
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    rec = log.compensation(0, "payout")
+    assert rec["quantity_compensated"] == 6.0
+    assert rec["quantity_pending"] == 0.0
+    assert len(sent) == 3
+    assert errors == []
+    # after exhaustion a replay sends nothing again
+    before = len(sent)
+    out = log.run_compensation(0, "payout", lambda: sent.append(2.0), target="alice", quantity=2.0, replay_only=True)
+    assert out == {"to": "alice", "n": 2}
+    assert len(sent) == before
+
+
+def test_branch_inherits_per_target_confirmed_compensation(tmp_path):
+    main = _multi_payee_log(tmp_path, total=9.0)
+    main.run_compensation(0, "payout", lambda: {"to": "alice"}, target="alice", quantity=2.0)
+    with pytest.raises(ad.ExternalEffectUncertain):
+        main.run_compensation(
+            0, "payout",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("lost")),
+            target="bob", quantity=1.0,
+        )
+    branch = main.create_branch("replan", 0, tmp_path / "branch.jsonl")
+    inherited = [e for e in branch.inherited_effects() if e.get("name") == "payout"]
+    comp = next(e for e in inherited if e.get("target") == "alice")
+    assert comp["quantity_compensated"] == 2.0
+    # bob's unconfirmed send is not inherited as an occurrence
+    assert not [e for e in inherited if e.get("target") == "bob" and e.get("quantity_pending")]
