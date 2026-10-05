@@ -449,3 +449,108 @@ def test_partial_verification_preserves_facts_and_attempt_basis(tmp_path):
     # the released balance is executable again, up to the approval boundary
     log.run_compensation(0, "register", lambda: {"offset": 3.5}, quantity=3.5)
     assert log.compensation(0, "register")["quantity_compensated"] == 5.0
+
+
+def test_multiple_recipients_reallocation_and_late_receipt_boundary(tmp_path):
+    path = tmp_path / "log.jsonl"
+    log = ad.TrainingEventLog(path)
+    run_completed_step(log, 0, effects=["register"])
+    log.decide_compensation(
+        0, "register", "compensate",
+        quantity=10.0, allocations={"vendor-a": 4.0, "vendor-b": 6.0},
+    )
+
+    external_actions = []
+    log.run_compensation(
+        0, "register",
+        lambda: external_actions.append(("vendor-a", 1.0)) or {"offset": 1.0},
+        quantity=1.0, recipient_id="vendor-a", attempt_id="a-ok",
+    )
+    with pytest.raises(ad.ExternalEffectUncertain):
+        log.run_compensation(
+            0, "register",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("a timeout")),
+            quantity=2.0, recipient_id="vendor-a", attempt_id="a-pending",
+        )
+    # vendor-b is independent and can continue while vendor-a waits.
+    log.run_compensation(
+        0, "register",
+        lambda: external_actions.append(("vendor-b", 2.0)) or {"offset": 2.0},
+        quantity=2.0, recipient_id="vendor-b", attempt_id="b-ok",
+    )
+
+    reopened = ad.TrainingEventLog(path)
+    allowance = reopened.compensation_allowance(0, "register")
+    assert allowance["total_quantity_approved"] == 10.0
+    assert allowance["total_quantity_allocated"] == 10.0
+    assert allowance["total_quantity_compensated"] == 3.0
+    assert allowance["total_quantity_pending"] == 2.0
+    assert allowance["recipients"]["vendor-a"]["quantity_available"] == 1.0
+    assert allowance["recipients"]["vendor-b"]["quantity_available"] == 4.0
+    # The 2 pending units remain owned by vendor-a and cannot be moved.
+    with pytest.raises(ad.CompensationError):
+        reopened.reallocate_compensation(0, "register", "vendor-a", 2.0, "vendor-b")
+
+    options = reopened.compensation_reallocation_options(
+        0, "register", "vendor-a", quantity=1.0,
+        target_recipient_ids=["vendor-b"],
+    )
+    assert options["retain"]["recipients"]["vendor-a"]["quantity_allowed"] == 4.0
+    assert options["withdraw"]["total_quantity_allocated"] == 9.0
+    assert options["withdraw"]["total_quantity_withdrawn"] == 1.0
+    assert options["transfers"]["vendor-b"]["recipients"]["vendor-b"]["quantity_allowed"] == 7.0
+    # Computing options never mutates the ledger.
+    assert reopened.compensation_allowance(0, "register")["total_quantity_allocated"] == 10.0
+
+    reopened.reallocate_compensation(
+        0, "register", "vendor-a", 1.0, "vendor-b", note="move only unused quota",
+    )
+    reopened.run_compensation(
+        0, "register",
+        lambda: external_actions.append(("vendor-b", 1.0)) or {"offset": 3.0},
+        quantity=1.0, recipient_id="vendor-b", attempt_id="b-transferred",
+    )
+    # The old receipt stays tied to vendor-a; presenting it for vendor-b fails.
+    with pytest.raises(ad.CompensationError):
+        reopened.verify_compensation(
+            0, "register", True, {"offset": 2.0},
+            quantity=2.0, recipient_id="vendor-b", attempt_id="a-pending",
+            receipt_id="old-a-receipt",
+        )
+    rec = reopened.verify_compensation(
+        0, "register", True, {"offset": 1.0},
+        quantity=1.0, recipient_id="vendor-a", attempt_id="a-pending",
+        receipt_id="partial-a-receipt", note="one of two arrived",
+    )
+    with pytest.raises(ad.CompensationError):
+        reopened.verify_compensation(
+            0, "register", True, {"offset": 1.0},
+            recipient_id="vendor-b", receipt_id="partial-a-receipt",
+        )
+    assert rec["quantity_compensated"] == 5.0
+    assert rec["quantity_pending"] == 1.0
+    duplicate = reopened.verify_compensation(
+        0, "register", True, {"offset": 1.0},
+        quantity=1.0, recipient_id="vendor-a", attempt_id="a-pending",
+        receipt_id="partial-a-receipt",
+    )
+    assert duplicate["quantity_compensated"] == 5.0
+    rec = reopened.verify_compensation(
+        0, "register", False,
+        recipient_id="vendor-a", attempt_id="a-pending",
+        receipt_id="a-final-receipt", note="remaining one never ran",
+    )
+    assert rec["quantity_compensated"] == 5.0
+    assert rec["quantity_pending"] == 0.0
+
+    final = reopened.compensation_allowance(0, "register")
+    assert final["total_quantity_approved"] == 10.0
+    assert final["total_quantity_allocated"] == 10.0
+    assert final["total_quantity_compensated"] == 5.0
+    assert final["recipients"]["vendor-a"]["quantity_compensated"] == 2.0
+    assert final["recipients"]["vendor-b"]["quantity_compensated"] == 3.0
+    assert external_actions == [
+        ("vendor-a", 1.0), ("vendor-b", 2.0), ("vendor-b", 1.0),
+    ]
+    audit_notes = [event["payload"].get("note", "") for event in reopened.audit_events(0)]
+    assert "move only unused quota" in audit_notes

@@ -154,6 +154,24 @@ log.decide_compensation(step, "reserve", "retain")                   # 保留登
 log.decide_compensation(step, "publish", "pending")                  # 仍等待核实
 ```
 
+一次总批准可以拆给多个互相独立的外部收款对象；拆分数量之和必须等于总批准数量：
+
+```python
+log.decide_compensation(
+    step, "submit", "compensate",
+    quantity=10.0, allocations={"vendor-a": 4.0, "vendor-b": 6.0},
+)
+log.run_compensation(step, "submit", apply, quantity=2.0,
+                     recipient_id="vendor-a", attempt_id="a-1")
+log.compensation_allowance(step, "submit")
+```
+
+每个对象的已确认、待核对、可用额度与总批准分别核对。某对象已发出但尚未确认的数量继续占用该对象额度，
+其他对象仍可并行执行。未使用额度不会自动共享；只有显式调用 `reallocate_compensation` 才会转移，
+省略目标对象表示撤回。`compensation_reallocation_options` 可在不修改台账的前提下比较维持原分配、
+撤回和部分转移。迟到回执必须携带原对象、尝试 ID 与回执 ID；旧对象待核对额度未解除前不能转走，
+同一回执也不能在新对象重复扣记。
+
 - `run_compensation(step, name, apply, replay, quantity=...)` 执行抵消效果，本身也会落入
   `occurred / unconfirmed / not_occurred`；已确认的补偿再次申请只会重放记录，重复申请
   不会双重抵消。请求数量超过剩余批准余额（批准 − 已确认 − 待核对）时在执行任何外部

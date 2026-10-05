@@ -263,7 +263,42 @@ class TrainingEventLog:
                 "call decide_compensation first"
             )
         record = deepcopy(self._events[key]["payload"])
+        record = self._normalize_compensation_record(record)
+        return record
+
+    @staticmethod
+    def _normalize_compensation_record(record: dict[str, Any]) -> dict[str, Any]:
         record.setdefault("quantity_pending", 0.0)
+        record.setdefault("total_quantity_approved", record.get("quantity_allowed", 0.0))
+        record.setdefault("quantity_withdrawn", 0.0)
+        record.setdefault("attempts", [])
+        if "recipients" not in record:
+            record["recipients"] = {
+                "default": {
+                    "quantity_allowed": float(record.get("quantity_allowed", 0.0)),
+                    "quantity_compensated": float(record.get("quantity_compensated", 0.0)),
+                    "quantity_pending": float(record.get("quantity_pending", 0.0)),
+                    "quantity_withdrawn": 0.0,
+                }
+            }
+        for recipient in record["recipients"].values():
+            recipient.setdefault("quantity_allowed", 0.0)
+            recipient.setdefault("quantity_compensated", 0.0)
+            recipient.setdefault("quantity_pending", 0.0)
+            recipient.setdefault("quantity_withdrawn", 0.0)
+        record["quantity_allowed"] = sum(
+            float(item["quantity_allowed"]) for item in record["recipients"].values()
+        )
+        record["quantity_compensated"] = sum(
+            float(item["quantity_compensated"]) for item in record["recipients"].values()
+        )
+        record["quantity_pending"] = sum(
+            float(item["quantity_pending"]) for item in record["recipients"].values()
+        )
+        record["total_quantity_allocated"] = float(record["quantity_allowed"])
+        record["quantity_withdrawn"] = sum(
+            float(item.get("quantity_withdrawn", 0.0)) for item in record["recipients"].values()
+        )
         return record
 
     def _write_compensation(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -283,6 +318,9 @@ class TrainingEventLog:
             "quantity_allowed": record["quantity_allowed"],
             "quantity_compensated": record["quantity_compensated"],
             "quantity_pending": record.get("quantity_pending", 0.0),
+            "total_quantity_approved": record.get("total_quantity_approved", record["quantity_allowed"]),
+            "total_quantity_allocated": record.get("total_quantity_allocated", record["quantity_allowed"]),
+            "quantity_withdrawn": record.get("quantity_withdrawn", 0.0),
             "note": note,
         }
         payload.update(extra)
@@ -298,6 +336,7 @@ class TrainingEventLog:
         decision: str,
         *,
         quantity: float | None = None,
+        allocations: dict[str, float] | None = None,
         note: str = "",
     ) -> dict[str, Any]:
         """Record the human arrangement for an external fact of a step.
@@ -322,31 +361,64 @@ class TrainingEventLog:
         key = self._comp_key(step_id, name)
         if key in self._events:
             record = deepcopy(self._events[key]["payload"])
-            record.setdefault("quantity_pending", 0.0)
-            if record["status"] == "occurred" and record["decision"] != decision:
+            record = self._normalize_compensation_record(record)
+            executed = record["quantity_compensated"] > 0.0
+            if executed and record["decision"] != decision:
                 raise EventExistsError(
                     f"compensation for effect {name!r} already executed; the decision is locked"
                 )
             record["decision"] = decision
             if quantity is not None:
-                committed = record["quantity_compensated"] + record["quantity_pending"]
+                total = float(record.get("total_quantity_approved", record["quantity_allowed"]))
+                if float(quantity) != total:
+                    raise CompensationError(
+                        "the total compensation approval cannot change after approval; "
+                        "use reallocate_compensation to move unused recipient quota"
+                    )
+                recipient = record["recipients"]["default"]
+                committed = recipient["quantity_compensated"] + recipient["quantity_pending"]
                 if float(quantity) < committed:
                     raise CompensationError(
                         "allowed quantity cannot be below the already compensated "
                         "or still unconfirmed amount"
                     )
-                record["quantity_allowed"] = float(quantity)
+                record["total_quantity_approved"] = float(quantity)
+                recipient["quantity_allowed"] = float(quantity)
         else:
             inherited = self._inherited_compensated_quantity(step_id, name)
+            allowed = 1.0 if quantity is None else float(quantity)
+            allocation_map = {"default": allowed}
+            if allocations is not None:
+                allocation_map = {str(recipient_id): float(value) for recipient_id, value in allocations.items()}
+                if any(value < 0.0 for value in allocation_map.values()):
+                    raise CompensationError("recipient allocations cannot be negative")
+                allocation_total = sum(allocation_map.values())
+                if quantity is None:
+                    allowed = allocation_total
+                elif abs(allocation_total - float(quantity)) > 1e-9:
+                    raise CompensationError("recipient allocations must sum to the total approved quantity")
             record = {
                 "step": step_id,
                 "name": name,
                 "target": TrainingStep._effect_key(step_id, name),
                 "decision": decision,
                 "status": "occurred" if inherited > 0 else "not_started",
-                "quantity_allowed": 1.0 if quantity is None else float(quantity),
+                "quantity_allowed": allowed,
                 "quantity_compensated": inherited,
                 "quantity_pending": 0.0,
+                "total_quantity_approved": allowed,
+                "total_quantity_allocated": allowed,
+                "quantity_withdrawn": 0.0,
+                "recipients": {
+                    recipient_id: {
+                        "quantity_allowed": value,
+                        "quantity_compensated": inherited if recipient_id == "default" else 0.0,
+                        "quantity_pending": 0.0,
+                        "quantity_withdrawn": 0.0,
+                    }
+                    for recipient_id, value in allocation_map.items()
+                },
+                "attempts": [],
                 "payload": None,
                 "reason": None,
             }
@@ -398,6 +470,8 @@ class TrainingEventLog:
         replay: Callable[[Any], Any] | None = None,
         *,
         quantity: float | None = None,
+        recipient_id: str = "default",
+        attempt_id: str | None = None,
     ) -> Any:
         """Execute the compensating effect once, within the allowed scope.
 
@@ -407,6 +481,7 @@ class TrainingEventLog:
         """
         step_id = str(step_id)
         name = str(effect_name)
+        recipient_id = str(recipient_id)
         record = self._compensation_record(step_id, name)
         if record["decision"] != "compensate":
             raise CompensationError(
@@ -418,15 +493,16 @@ class TrainingEventLog:
                 f"effect {name!r} of step {step_id!r} is {effect_status}; without evidence "
                 "that the original effect occurred no compensation may execute"
             )
-        remaining = (
-            record["quantity_allowed"]
-            - record["quantity_compensated"]
-            - record["quantity_pending"]
-        )
-        if record["status"] == "unconfirmed":
+        recipient = record["recipients"].get(recipient_id)
+        if recipient is None:
+            raise CompensationError(f"compensation recipient {recipient_id!r} has no allocation")
+        if recipient.get("quantity_withdrawn", 0.0) > 0 and recipient["quantity_compensated"] + recipient["quantity_pending"] <= 0:
+            raise CompensationError(f"recipient {recipient_id!r} allocation was withdrawn")
+        remaining = recipient["quantity_allowed"] - recipient["quantity_compensated"] - recipient["quantity_pending"]
+        recipient_has_pending = recipient["quantity_pending"] > 0.0
+        if recipient_has_pending:
             raise UnconfirmedEffectError(
-                f"compensation for effect {name!r} is unconfirmed; "
-                "call verify_compensation with the late receipt before retrying"
+                f"recipient {recipient_id!r} has unconfirmed compensation; resolve its receipt before retrying"
             )
         if quantity is not None and float(quantity) > remaining:
             raise CompensationError(
@@ -445,40 +521,90 @@ class TrainingEventLog:
         qty = remaining if quantity is None else float(quantity)
         if qty <= 0:
             raise CompensationError("compensation quantity must be positive")
+        attempt_id = str(attempt_id) if attempt_id is not None else f"{recipient_id}:{len(record['attempts']) + 1}"
+        if any(item["attempt_id"] == attempt_id for item in record["attempts"]):
+            previous = next(item for item in record["attempts"] if item["attempt_id"] == attempt_id)
+            if previous["recipient_id"] != recipient_id or float(previous.get("quantity", 0.0)) != qty:
+                raise EventExistsError("compensation attempt id was already used with different data")
+            if previous["status"] == "occurred":
+                return replay(previous["payload"]) if replay is not None else deepcopy(previous["payload"])
+            raise UnconfirmedEffectError(f"compensation attempt {attempt_id!r} is still unconfirmed")
         try:
             payload = apply()
         except ExternalEffectUncertain as exc:
+            recipient["quantity_pending"] += qty
+            record = self._normalize_compensation_record(record)
             record["status"] = "unconfirmed"
             record["reason"] = str(exc)
-            record["quantity_pending"] += qty
+            record["attempts"].append({
+                "attempt_id": attempt_id,
+                "recipient_id": recipient_id,
+                "quantity": qty,
+                "status": "unconfirmed",
+                "payload": None,
+                "reason": str(exc),
+            })
             self._write_compensation(record)
             self._append_compensation_audit(
-                record, "attempt", str(exc), {"quantity": qty, "outcome": "uncertain"}
+                record, "attempt", str(exc),
+                {"quantity": qty, "outcome": "uncertain", "recipient_id": recipient_id, "attempt_id": attempt_id},
             )
             raise
         except ExternalEffectNotExecuted as exc:
-            record["status"] = "not_occurred"
+            record = self._normalize_compensation_record(record)
+            record["status"] = "unconfirmed" if record["quantity_pending"] > 0.0 else "not_occurred"
             record["reason"] = str(exc)
+            record["attempts"].append({
+                "attempt_id": attempt_id,
+                "recipient_id": recipient_id,
+                "quantity": qty,
+                "status": "not_occurred",
+                "payload": None,
+                "reason": str(exc),
+            })
             self._write_compensation(record)
             self._append_compensation_audit(
-                record, "attempt", str(exc), {"quantity": qty, "outcome": "not_occurred"}
+                record, "attempt", str(exc),
+                {"quantity": qty, "outcome": "not_occurred", "recipient_id": recipient_id, "attempt_id": attempt_id},
             )
             raise
         except Exception as exc:
+            recipient["quantity_pending"] += qty
+            record = self._normalize_compensation_record(record)
             record["status"] = "unconfirmed"
             record["reason"] = repr(exc)
-            record["quantity_pending"] += qty
+            record["attempts"].append({
+                "attempt_id": attempt_id,
+                "recipient_id": recipient_id,
+                "quantity": qty,
+                "status": "unconfirmed",
+                "payload": None,
+                "reason": repr(exc),
+            })
             self._write_compensation(record)
             self._append_compensation_audit(
-                record, "attempt", repr(exc), {"quantity": qty, "outcome": "uncertain"}
+                record, "attempt", repr(exc),
+                {"quantity": qty, "outcome": "uncertain", "recipient_id": recipient_id, "attempt_id": attempt_id},
             )
             raise
-        record["status"] = "occurred"
-        record["payload"] = payload
+        recipient["quantity_compensated"] += qty
+        record = self._normalize_compensation_record(record)
+        record["status"] = "unconfirmed" if record["quantity_pending"] > 0.0 else "occurred"
+        record["payload"] = payload if recipient_id == "default" else record.get("payload")
         record["reason"] = None
-        record["quantity_compensated"] += qty
+        record["attempts"].append({
+            "attempt_id": attempt_id,
+            "recipient_id": recipient_id,
+            "quantity": qty,
+            "status": "occurred",
+            "payload": payload,
+            "reason": None,
+        })
         self._write_compensation(record)
-        self._append_compensation_audit(record, "receipt", "", {"quantity": qty, "payload": deepcopy(payload)})
+        self._append_compensation_audit(
+            record, "receipt", "",
+            {"quantity": qty, "payload": deepcopy(payload), "recipient_id": recipient_id, "attempt_id": attempt_id},
+        )
         return replay(payload) if replay is not None else deepcopy(payload)
 
     def verify_compensation(
@@ -489,6 +615,9 @@ class TrainingEventLog:
         payload: Any = None,
         *,
         quantity: float | None = None,
+        recipient_id: str = "default",
+        attempt_id: str | None = None,
+        receipt_id: str | None = None,
         note: str = "",
     ) -> dict[str, Any]:
         """Resolve an unconfirmed compensation from a (possibly late) receipt.
@@ -498,45 +627,239 @@ class TrainingEventLog:
         """
         step_id = str(step_id)
         name = str(effect_name)
+        recipient_id = str(recipient_id)
         record = self._compensation_record(step_id, name)
-        if record["status"] == "occurred":
+        recipient = record["recipients"].get(recipient_id)
+        if recipient is None:
+            raise CompensationError(f"compensation recipient {recipient_id!r} has no allocation")
+        verification_prefix = f"{self._comp_key(step_id, name)}:verification:"
+        next_receipt_number = len([e for e in self._history if e["id"].startswith(verification_prefix)]) + 1
+        receipt_id = str(receipt_id) if receipt_id is not None else f"receipt:{next_receipt_number}"
+        known_receipt_attempts = [item for item in record["attempts"] if item.get("receipt_id") == receipt_id]
+        if known_receipt_attempts:
+            known_recipient = known_receipt_attempts[-1]["recipient_id"]
+            if known_recipient != recipient_id:
+                raise CompensationError(
+                    f"receipt {receipt_id!r} belongs to {known_recipient!r}; it cannot be charged to {recipient_id!r}"
+                )
+            self._append_compensation_audit(
+                record, "verification", note,
+                {"duplicate": True, "recipient_id": recipient_id, "attempt_id": attempt_id, "receipt_id": receipt_id},
+            )
+            return deepcopy(record)
+        if attempt_id is None and recipient["quantity_pending"] <= 0.0:
             if not occurred:
                 raise EventExistsError(
-                    f"compensation for effect {name!r} was already confirmed; it cannot be revoked"
+                    f"compensation for recipient {recipient_id!r} was already confirmed; it cannot be revoked"
+                )
+            self._append_compensation_audit(
+                record, "verification", note,
+                {"duplicate": True, "recipient_id": recipient_id, "receipt_id": receipt_id},
+            )
+            return deepcopy(record)
+        if attempt_id is None:
+            pending_attempts = [
+                item for item in record["attempts"]
+                if item["recipient_id"] == recipient_id and item["status"] == "unconfirmed"
+            ]
+            if len(pending_attempts) != 1:
+                raise CompensationError("attempt_id is required when zero or multiple attempts are pending")
+            attempt = pending_attempts[0]
+        else:
+            attempt_id = str(attempt_id)
+            matches = [item for item in record["attempts"] if item["attempt_id"] == attempt_id]
+            if not matches:
+                raise KeyError(f"compensation attempt {attempt_id!r} not found")
+            attempt = matches[-1]
+            if attempt["recipient_id"] != recipient_id:
+                raise CompensationError(
+                    f"attempt {attempt_id!r} belongs to {attempt['recipient_id']!r}, not {recipient_id!r}"
+                )
+        if attempt["status"] == "occurred":
+            if not occurred:
+                raise EventExistsError(
+                    f"compensation attempt {attempt['attempt_id']!r} was already confirmed; it cannot be revoked"
                 )
             self._append_compensation_audit(record, "verification", note, {"duplicate": True})
             return deepcopy(record)
-        if record["status"] != "unconfirmed":
+        if attempt["status"] != "unconfirmed":
             raise UnconfirmedEffectError(
-                f"compensation for effect {name!r} is {record['status']}; nothing to verify"
+                f"compensation attempt {attempt['attempt_id']!r} is {attempt['status']}; nothing to verify"
             )
+        pending = float(attempt.get("quantity_pending", attempt["quantity"]))
         if occurred:
-            pending = record["quantity_pending"]
             qty = pending if quantity is None else float(quantity)
-            if qty > pending:
+            if qty <= 0.0 or qty > pending:
                 raise CompensationError(
-                    f"receipt confirms {qty} but only {pending} of compensation for effect "
-                    f"{name!r} is pending; confirming more than was attempted would "
-                    "consume the approval twice"
+                    f"receipt confirms {qty} but only {pending} of attempt {attempt['attempt_id']!r} is pending"
                 )
-            if qty > record["quantity_allowed"] - record["quantity_compensated"]:
+            if qty > recipient["quantity_allowed"] - recipient["quantity_compensated"]:
                 raise CompensationError(
                     "confirmed quantity exceeds the remaining approved balance; "
                     "the approval boundary cannot be met by trimming only the internal record"
                 )
-            record["quantity_pending"] -= qty
-            record["quantity_compensated"] += qty
-            record["status"] = "occurred" if record["quantity_pending"] <= 0 else "unconfirmed"
-            record["payload"] = payload
-            record["reason"] = None
+            recipient["quantity_pending"] -= qty
+            recipient["quantity_compensated"] += qty
+            remainder = pending - qty
+            attempt["quantity_pending"] = remainder
+            attempt["status"] = "occurred" if remainder <= 0.0 else "unconfirmed"
+            attempt["payload"] = payload
+            attempt["reason"] = None
         else:
-            record["quantity_pending"] = 0.0
-            record["status"] = "not_occurred"
-            record["payload"] = None
+            recipient["quantity_pending"] -= pending
+            attempt["quantity_pending"] = 0.0
+            attempt["status"] = "not_occurred"
+            attempt["payload"] = None
+            qty = 0.0
+        record = self._normalize_compensation_record(record)
+        record["status"] = "unconfirmed" if record["quantity_pending"] > 0.0 else "occurred"
+        record["reason"] = None if record["status"] == "occurred" else "one or more attempts are unconfirmed"
+        attempt["receipt_id"] = receipt_id
         self._write_compensation(record)
         self._append_compensation_audit(
             record, "verification", note,
-            {"occurred": bool(occurred), "quantity": qty if occurred else 0.0},
+            {
+                "occurred": bool(occurred),
+                "quantity": qty,
+                "recipient_id": recipient_id,
+                "attempt_id": attempt["attempt_id"],
+                "receipt_id": receipt_id,
+            },
+        )
+        return deepcopy(record)
+
+    def compensation_allowance(self, step_id: str | int, effect_name: str) -> dict[str, Any]:
+        """Reconcile total approval against each recipient's separate quota."""
+        record = self._compensation_record(step_id, effect_name)
+        recipients = record["recipients"]
+        recipient_report = {}
+        for recipient_id, recipient in recipients.items():
+            committed = recipient["quantity_compensated"] + recipient["quantity_pending"]
+            recipient_report[recipient_id] = {
+                "quantity_allowed": recipient["quantity_allowed"],
+                "quantity_compensated": recipient["quantity_compensated"],
+                "quantity_pending": recipient["quantity_pending"],
+                "quantity_available": recipient["quantity_allowed"] - committed,
+                "quantity_withdrawn": recipient.get("quantity_withdrawn", 0.0),
+            }
+        allocated = sum(item["quantity_allowed"] for item in recipients.values())
+        withdrawn = sum(item.get("quantity_withdrawn", 0.0) for item in recipients.values())
+        confirmed = sum(item["quantity_compensated"] for item in recipients.values())
+        pending = sum(item["quantity_pending"] for item in recipients.values())
+        return {
+            "total_quantity_approved": record["total_quantity_approved"],
+            "total_quantity_allocated": allocated,
+            "total_quantity_withdrawn": withdrawn,
+            "total_quantity_compensated": confirmed,
+            "total_quantity_pending": pending,
+            "total_quantity_available": allocated - confirmed - pending,
+            "recipients": recipient_report,
+        }
+
+    def compensation_reallocation_options(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        source_recipient_id: str,
+        *,
+        quantity: float | None = None,
+        target_recipient_ids: list[str] | tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Return non-mutating retain / withdraw / partial-transfer options."""
+        allowance = self.compensation_allowance(step_id, effect_name)
+        source_recipient_id = str(source_recipient_id)
+        source = allowance["recipients"].get(source_recipient_id)
+        if source is None:
+            raise CompensationError(f"source recipient {source_recipient_id!r} has no allocation")
+        available = float(source["quantity_available"])
+        qty = available if quantity is None else float(quantity)
+        if qty <= 0.0 or qty > available:
+            raise CompensationError(
+                f"reallocation quantity {qty} must be within unused source quota {available}; "
+                "confirmed and pending quota is not movable"
+            )
+        def projected(withdraw: bool = False, target: str | None = None) -> dict[str, Any]:
+            recipients = deepcopy(allowance["recipients"])
+            recipients[source_recipient_id]["quantity_allowed"] -= qty
+            recipients[source_recipient_id]["quantity_available"] -= qty
+            if withdraw:
+                recipients[source_recipient_id]["quantity_withdrawn"] += qty
+            else:
+                target = str(target)
+                recipients.setdefault(target, {
+                    "quantity_allowed": 0.0,
+                    "quantity_compensated": 0.0,
+                    "quantity_pending": 0.0,
+                    "quantity_available": 0.0,
+                    "quantity_withdrawn": 0.0,
+                })
+                recipients[target]["quantity_allowed"] += qty
+                recipients[target]["quantity_available"] += qty
+            allocated = sum(item["quantity_allowed"] for item in recipients.values())
+            withdrawn = sum(item["quantity_withdrawn"] for item in recipients.values())
+            return {
+                "quantity": qty,
+                "total_quantity_allocated": allocated,
+                "total_quantity_withdrawn": withdrawn,
+                "recipients": recipients,
+            }
+        return {
+            "retain": projected(target=source_recipient_id),
+            "withdraw": projected(withdraw=True),
+            "transfers": {
+                str(target): projected(target=target)
+                for target in target_recipient_ids
+            },
+        }
+
+    def reallocate_compensation(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        source_recipient_id: str,
+        quantity: float,
+        target_recipient_id: str | None = None,
+        *,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Move or withdraw only explicitly identified unused recipient quota."""
+        step_id = str(step_id)
+        name = str(effect_name)
+        source_recipient_id = str(source_recipient_id)
+        qty = float(quantity)
+        record = self._compensation_record(step_id, name)
+        source = record["recipients"].get(source_recipient_id)
+        if source is None:
+            raise CompensationError(f"source recipient {source_recipient_id!r} has no allocation")
+        available = source["quantity_allowed"] - source["quantity_compensated"] - source["quantity_pending"]
+        if qty <= 0.0 or qty > available:
+            raise CompensationError(
+                f"reallocation quantity {qty} must be within unused source quota {available}; "
+                "confirmed and pending quota is not movable"
+            )
+        action = "withdraw" if target_recipient_id is None else "transfer"
+        target_recipient_id = None if target_recipient_id is None else str(target_recipient_id)
+        source["quantity_allowed"] -= qty
+        if action == "withdraw":
+            source["quantity_withdrawn"] = source.get("quantity_withdrawn", 0.0) + qty
+        else:
+            destination = record["recipients"].setdefault(target_recipient_id, {
+                "quantity_allowed": 0.0,
+                "quantity_compensated": 0.0,
+                "quantity_pending": 0.0,
+                "quantity_withdrawn": 0.0,
+            })
+            destination["quantity_allowed"] += qty
+        record = self._normalize_compensation_record(record)
+        self._write_compensation(record)
+        self._append_compensation_audit(
+            record, "reallocation", note,
+            {
+                "action": action,
+                "quantity": qty,
+                "source_recipient_id": source_recipient_id,
+                "target_recipient_id": target_recipient_id,
+            },
         )
         return deepcopy(record)
 
@@ -553,7 +876,7 @@ class TrainingEventLog:
         if status == "unconfirmed":
             return {"effect": name, "status": status, "resolution": "conflict", "detail": "unconfirmed"}
         key = self._comp_key(step_id, name)
-        record = deepcopy(self._events[key]["payload"]) if key in self._events else None
+        record = self._normalize_compensation_record(deepcopy(self._events[key]["payload"])) if key in self._events else None
         if record is None or record["decision"] == "pending":
             return {"effect": name, "status": status, "resolution": "conflict", "detail": "awaiting_decision"}
         if record["decision"] == "retain":
