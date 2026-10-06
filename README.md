@@ -172,6 +172,31 @@ log.compensation_allowance(step, "submit")
 撤回和部分转移。迟到回执必须携带原对象、尝试 ID 与回执 ID；旧对象待核对额度未解除前不能转走，
 同一回执也不能在新对象重复扣记。
 
+多笔转移与撤回也可以组成一个**分批调整方案**整体提交、分批执行：
+
+```python
+log.plan_compensation_adjustment(step, "submit", [
+    {"source": "vendor-a", "target": "vendor-b", "quantity": 3.0, "adjustment_id": "a-to-b"},
+    {"source": "vendor-b", "target": None, "quantity": 1.0, "adjustment_id": "b-drop"},  # 撤回
+], plan_id="batch-1")
+log.run_compensation_adjustment(step, "submit", "batch-1", "a-to-b")       # 发送，额度进入在途
+log.verify_compensation_adjustment(step, "submit", "batch-1", "a-to-b", True,
+                                   quantity=1.5, receipt_id="r-1")          # 部分回执
+log.cancel_compensation_adjustment(step, "submit", "batch-1", "b-drop")    # 仅未发送可取消
+log.compensation_allowance(step, "submit")["total_quantity_in_transit"]    # 在途核对
+```
+
+- **整体核对**：方案按每个对象的净变动与“已批准 − 已确认 − 待回执”推导出的真正未使用
+  额度核对；循环转移净额为零可以成立，多条转移共用同一额度、逐条看似合法但合计超额
+  的方案会被整体拒绝，待回执资金不会被当成空余额。
+- **在途区间**：发送后数量离开源对象但尚未到达目标，记为在途（既不可用也未撤回）。
+  只收到部分回执时，已确认部分立即生效，剩余区间继续保留在途；失败回执把未确认部分
+  退回源对象。每次核实都是独立的核对决定并追加审计，绝不追溯改写原批准额度。
+- **回执边界**：重复回执只追加审计记录、不重复生效；回执绑定原始调整 ID，不能记到
+  另一笔调整上。已发送的调整不能取消，必须等回执或显式核实为失败。
+- **持久化**：方案与每笔调整状态都写入追加式 JSONL，进程重开后可继续分批发送、
+  核实或取消；`compensation_allowance` 满足守恒：总批准 = 已分配 + 已撤回 + 在途。
+
 - `run_compensation(step, name, apply, replay, quantity=...)` 执行抵消效果，本身也会落入
   `occurred / unconfirmed / not_occurred`；已确认的补偿再次申请只会重放记录，重复申请
   不会双重抵消。请求数量超过剩余批准余额（批准 − 已确认 − 待核对）时在执行任何外部
