@@ -172,6 +172,33 @@ log.compensation_allowance(step, "submit")
 撤回和部分转移。迟到回执必须携带原对象、尝试 ID 与回执 ID；旧对象待核对额度未解除前不能转走，
 同一回执也不能在新对象重复扣记。
 
+多笔调整必须先作为一个方案整体提出，再逐笔发送：
+
+```python
+plan = log.propose_compensation_adjustments(
+    step, "submit",
+    [
+        {"adjustment_id": "a-to-b", "action": "transfer",
+         "source_recipient_id": "vendor-a", "target_recipient_id": "vendor-b",
+         "quantity": 1.0},
+        {"adjustment_id": "drop-c", "action": "withdraw",
+         "source_recipient_id": "vendor-c", "quantity": 0.5},
+    ],
+    plan_id="batch-1",
+)
+log.execute_compensation_adjustment(step, "submit", "batch-1", send, adjustment_id="a-to-b")
+log.verify_compensation_adjustment(step, "submit", "batch-1", "a-to-b", True,
+                                  receipt, quantity=1.0, receipt_id="receipt-1")
+log.cancel_compensation_adjustments(step, "submit", "batch-1", adjustment_id="drop-c")
+```
+
+提出方案时只按“批准 − 已确认 − 待回执 − 其他方案预留”计算可调整额度；待回执不是空余额。同一来源的多笔
+转移、撤回以及循环转移按方案内总流出（gross）整体核对，不能依赖逐笔执行后的额度变化制造透支。每笔发送前
+都保留预留，发送成功才改变分配；失败明确未发送则释放预留，超时则保持待核对。部分回执只结算已确认数量，
+剩余区间继续占用；迟到更正写入独立的调整核对事件，不追溯修改原批准额度。只有仍处于未发送状态的调整可以
+取消；已发送的调整必须等成功、失败或部分回执明确处理。方案状态和每笔效果逐行持久化，重开日志后可继续执行，
+重复回执只追加审计，不会再次改变分配。
+
 - `run_compensation(step, name, apply, replay, quantity=...)` 执行抵消效果，本身也会落入
   `occurred / unconfirmed / not_occurred`；已确认的补偿再次申请只会重放记录，重复申请
   不会双重抵消。请求数量超过剩余批准余额（批准 − 已确认 − 待核对）时在执行任何外部

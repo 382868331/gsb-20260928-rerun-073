@@ -264,13 +264,362 @@ class TrainingEventLog:
             )
         record = deepcopy(self._events[key]["payload"])
         record = self._normalize_compensation_record(record)
+        self._refresh_adjustment_reservations(record)
         return record
+
+    def _adjustment_plan_key(self, step_id: str | int, effect_name: str, plan_id: str) -> str:
+        return f"{self._comp_key(step_id, effect_name)}:adjustment-plan:{plan_id}"
+
+    def _refresh_adjustment_reservations(self, record: dict[str, Any]) -> None:
+        for recipient in record["recipients"].values():
+            recipient["quantity_adjustment_reserved"] = 0.0
+        prefix = f"{self._comp_key(record['step'], record['name'])}:adjustment-plan:"
+        for event in self._events.values():
+            if event.get("kind") != "compensation_adjustment_plan" or not event["id"].startswith(prefix):
+                continue
+            plan = event["payload"]
+            for op in plan.get("operations", []):
+                if op.get("status") in ("queued", "sending", "unconfirmed"):
+                    source = record["recipients"].setdefault(op["source_recipient_id"], {
+                        "quantity_allowed": 0.0,
+                        "quantity_compensated": 0.0,
+                        "quantity_pending": 0.0,
+                        "quantity_withdrawn": 0.0,
+                        "quantity_adjustment_reserved": 0.0,
+                    })
+                    source["quantity_adjustment_reserved"] += float(op.get("quantity_reserved", op["quantity"]))
+        self._normalize_compensation_record(record)
+
+    @staticmethod
+    def _adjustment_status(operations: list[dict[str, Any]]) -> str:
+        statuses = {op["status"] for op in operations}
+        if statuses <= {"queued"}:
+            return "proposed"
+        if statuses <= {"cancelled"}:
+            return "cancelled"
+        if statuses <= {"occurred", "not_occurred", "cancelled"}:
+            if "occurred" in statuses:
+                return "occurred"
+            return "not_occurred"
+        if statuses & {"sending", "unconfirmed"}:
+            return "unconfirmed"
+        return "partially_executed"
+
+    def _write_adjustment_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
+        plan["status"] = self._adjustment_status(plan["operations"])
+        return self.append(
+            self._adjustment_plan_key(plan["step"], plan["name"], plan["plan_id"]),
+            plan, kind="compensation_adjustment_plan", phase="training", overwrite=True,
+        )
+
+    def compensation_adjustment_plan(
+        self, step_id: str | int, effect_name: str, plan_id: str,
+    ) -> dict[str, Any]:
+        return deepcopy(self.get(self._adjustment_plan_key(step_id, effect_name, plan_id))["payload"])
+
+    def propose_compensation_adjustments(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        adjustments: list[dict[str, Any]],
+        *,
+        plan_id: str | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Atomically propose a batch containing transfers and withdrawals.
+
+        Pending compensation and reservations from other proposals are not
+        available. The gross amount leaving each source is checked, so a
+        cycle or several operations sharing one quota cannot be accepted one
+        operation at a time and overdraw it in aggregate.
+        """
+        step_id = str(step_id)
+        name = str(effect_name)
+        if not adjustments:
+            raise CompensationError("a compensation adjustment plan must contain at least one operation")
+        plan_id = str(plan_id) if plan_id is not None else f"plan:{len(self._history) + 1}"
+        key = self._adjustment_plan_key(step_id, name, plan_id)
+        if key in self._events:
+            raise EventExistsError(f"compensation adjustment plan {plan_id!r} already exists")
+        record = self._compensation_record(step_id, name)
+        operations = []
+        gross_by_source: dict[str, float] = {}
+        adjustment_ids: set[str] = set()
+        for index, item in enumerate(adjustments):
+            action = str(item.get("action", ""))
+            if action not in ("transfer", "withdraw"):
+                raise CompensationError("each compensation adjustment must be a transfer or withdrawal")
+            source = str(item.get("source_recipient_id", ""))
+            adjustment_id = str(item.get("adjustment_id", f"{plan_id}:{index + 1}"))
+            if not source or adjustment_id in adjustment_ids:
+                raise CompensationError("adjustment ids and source recipients must be present and unique")
+            adjustment_ids.add(adjustment_id)
+            qty = float(item.get("quantity", 0.0))
+            if qty <= 0.0:
+                raise CompensationError("compensation adjustment quantities must be positive")
+            target = item.get("target_recipient_id")
+            target = None if target is None else str(target)
+            if action == "transfer":
+                if target is None or target == source:
+                    raise CompensationError("a transfer requires a target recipient different from its source")
+            elif target is not None:
+                raise CompensationError("a withdrawal must not name a target recipient")
+            if source not in record["recipients"]:
+                raise CompensationError(f"source recipient {source!r} has no allocation")
+            gross_by_source[source] = gross_by_source.get(source, 0.0) + qty
+            operations.append({
+                "adjustment_id": adjustment_id,
+                "action": action,
+                "source_recipient_id": source,
+                "target_recipient_id": target,
+                "quantity": qty,
+                "quantity_reserved": qty,
+                "quantity_settled": 0.0,
+                "status": "queued",
+                "payload": None,
+                "reason": None,
+                "receipt_id": None,
+            })
+        for source, gross in gross_by_source.items():
+            recipient = record["recipients"][source]
+            available = (
+                recipient["quantity_allowed"]
+                - recipient["quantity_compensated"]
+                - recipient["quantity_pending"]
+                - recipient.get("quantity_adjustment_reserved", 0.0)
+            )
+            if gross > available:
+                raise CompensationError(
+                    f"adjustment plan requests {gross} from {source!r} but only {available} is truly unused; "
+                    "confirmed, pending and reserved quota cannot be reused"
+                )
+        for op in operations:
+            record["recipients"][op["source_recipient_id"]]["quantity_adjustment_reserved"] += op["quantity"]
+        plan = {
+            "step": step_id,
+            "name": name,
+            "target": record["target"],
+            "plan_id": plan_id,
+            "status": "proposed",
+            "operations": operations,
+            "note": note,
+        }
+        self._write_compensation(record)
+        self._write_adjustment_plan(plan)
+        self._append_compensation_audit(
+            record, "adjustment_proposal", note,
+            {"plan_id": plan_id, "operations": deepcopy(operations)},
+        )
+        return deepcopy(plan)
+
+    def _settle_adjustment(self, record: dict[str, Any], op: dict[str, Any], qty: float) -> None:
+        source = record["recipients"][op["source_recipient_id"]]
+        source["quantity_adjustment_reserved"] -= qty
+        if op["action"] == "withdraw":
+            source["quantity_allowed"] -= qty
+            source["quantity_withdrawn"] = source.get("quantity_withdrawn", 0.0) + qty
+        else:
+            target_id = op["target_recipient_id"]
+            target = record["recipients"].setdefault(target_id, {
+                "quantity_allowed": 0.0,
+                "quantity_compensated": 0.0,
+                "quantity_pending": 0.0,
+                "quantity_withdrawn": 0.0,
+                "quantity_adjustment_reserved": 0.0,
+            })
+            source["quantity_allowed"] -= qty
+            target["quantity_allowed"] += qty
+        op["quantity_settled"] = float(op.get("quantity_settled", 0.0)) + qty
+
+    def _release_adjustment(self, record: dict[str, Any], op: dict[str, Any], qty: float) -> None:
+        record["recipients"][op["source_recipient_id"]]["quantity_adjustment_reserved"] -= qty
+
+    def execute_compensation_adjustment(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        plan_id: str,
+        apply: Callable[[dict[str, Any]], Any] | None = None,
+        *,
+        adjustment_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Send one queued adjustment; other queued items remain independently cancellable."""
+        step_id = str(step_id)
+        name = str(effect_name)
+        plan_id = str(plan_id)
+        plan = self.compensation_adjustment_plan(step_id, name, plan_id)
+        candidates = [op for op in plan["operations"] if adjustment_id is None or op["adjustment_id"] == str(adjustment_id)]
+        if adjustment_id is not None and not candidates:
+            raise KeyError(f"adjustment {adjustment_id!r} is not part of plan {plan_id!r}")
+        op = next((item for item in candidates if item["status"] == "queued"), None)
+        if op is None:
+            current = candidates[0] if adjustment_id is not None and candidates else None
+            if current is not None and current["status"] in ("sending", "unconfirmed"):
+                raise ExternalEffectUncertain(f"adjustment {current['adjustment_id']!r} is awaiting a receipt")
+            return plan
+        record = self._compensation_record(step_id, name)
+        plan = self.compensation_adjustment_plan(step_id, name, plan_id)
+        op = next(item for item in plan["operations"] if item["adjustment_id"] == op["adjustment_id"])
+        op["status"] = "sending"
+        op["reason"] = None
+        self._write_adjustment_plan(plan)
+        if apply is None:
+            return plan
+        try:
+            payload = apply(deepcopy(op))
+        except ExternalEffectNotExecuted as exc:
+            plan = self.compensation_adjustment_plan(step_id, name, plan_id)
+            op = next(item for item in plan["operations"] if item["adjustment_id"] == op["adjustment_id"])
+            record = self._compensation_record(step_id, name)
+            self._release_adjustment(record, op, op["quantity_reserved"])
+            op["quantity_reserved"] = 0.0
+            op["status"] = "not_occurred"
+            op["reason"] = str(exc)
+            self._write_compensation(record)
+            self._write_adjustment_plan(plan)
+            self._append_compensation_audit(
+                record, "adjustment_receipt", str(exc),
+                {"plan_id": plan_id, "adjustment_id": op["adjustment_id"], "outcome": "not_occurred"},
+            )
+            raise
+        except Exception as exc:
+            plan = self.compensation_adjustment_plan(step_id, name, plan_id)
+            op = next(item for item in plan["operations"] if item["adjustment_id"] == op["adjustment_id"])
+            op["status"] = "unconfirmed"
+            op["reason"] = str(exc)
+            self._write_adjustment_plan(plan)
+            raise
+        plan = self.compensation_adjustment_plan(step_id, name, plan_id)
+        op = next(item for item in plan["operations"] if item["adjustment_id"] == op["adjustment_id"])
+        record = self._compensation_record(step_id, name)
+        self._settle_adjustment(record, op, op["quantity_reserved"])
+        op["quantity_reserved"] = 0.0
+        op["status"] = "occurred"
+        op["payload"] = payload
+        op["reason"] = None
+        self._write_compensation(record)
+        self._write_adjustment_plan(plan)
+        self._append_compensation_audit(
+            record, "adjustment_receipt", "",
+            {"plan_id": plan_id, "adjustment_id": op["adjustment_id"], "outcome": "occurred", "payload": deepcopy(payload)},
+        )
+        return deepcopy(plan)
+
+    def verify_compensation_adjustment(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        plan_id: str,
+        adjustment_id: str,
+        occurred: bool,
+        payload: Any = None,
+        *,
+        quantity: float | None = None,
+        receipt_id: str | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Record an independent late or partial adjustment receipt."""
+        step_id = str(step_id)
+        name = str(effect_name)
+        plan_id = str(plan_id)
+        adjustment_id = str(adjustment_id)
+        plan = self.compensation_adjustment_plan(step_id, name, plan_id)
+        op = next((item for item in plan["operations"] if item["adjustment_id"] == adjustment_id), None)
+        if op is None:
+            raise KeyError(f"adjustment {adjustment_id!r} is not part of plan {plan_id!r}")
+        receipt_id = str(receipt_id) if receipt_id is not None else f"{plan_id}:{adjustment_id}:receipt"
+        known = next((item for item in plan["operations"] if receipt_id in item.get("receipt_ids", [])), None)
+        if known is not None:
+            if known["adjustment_id"] != adjustment_id:
+                raise CompensationError(f"receipt {receipt_id!r} belongs to adjustment {known['adjustment_id']!r}")
+            record = self._compensation_record(step_id, name)
+            self._append_compensation_audit(
+                record, "adjustment_verification", note,
+                {"plan_id": plan_id, "adjustment_id": adjustment_id, "receipt_id": receipt_id, "duplicate": True},
+            )
+            return plan
+        if op["status"] not in ("sending", "unconfirmed"):
+            if occurred:
+                record = self._compensation_record(step_id, name)
+                self._append_compensation_audit(
+                    record, "adjustment_verification", note,
+                    {"plan_id": plan_id, "adjustment_id": adjustment_id, "receipt_id": receipt_id, "duplicate": True},
+                )
+                return plan
+            raise EventExistsError(f"adjustment {adjustment_id!r} is already {op['status']}")
+        pending = float(op["quantity_reserved"])
+        record = self._compensation_record(step_id, name)
+        op = next(item for item in plan["operations"] if item["adjustment_id"] == adjustment_id)
+        if occurred:
+            qty = pending if quantity is None else float(quantity)
+            if qty <= 0.0 or qty > pending:
+                raise CompensationError(f"receipt confirms {qty} but {pending} of adjustment {adjustment_id!r} is unresolved")
+            self._settle_adjustment(record, op, qty)
+            op["quantity_reserved"] -= qty
+            op["payload"] = payload
+            op["reason"] = None
+            op["status"] = "occurred" if op["quantity_reserved"] <= 0.0 else "unconfirmed"
+        else:
+            qty = 0.0
+            self._release_adjustment(record, op, pending)
+            op["quantity_reserved"] = 0.0
+            op["status"] = "not_occurred"
+            op["reason"] = note or None
+        op.setdefault("receipt_ids", []).append(receipt_id)
+        op["receipt_id"] = receipt_id
+        self._write_compensation(record)
+        self._write_adjustment_plan(plan)
+        self._append_compensation_audit(
+            record, "adjustment_verification", note,
+            {
+                "plan_id": plan_id, "adjustment_id": adjustment_id,
+                "receipt_id": receipt_id, "occurred": bool(occurred), "quantity": qty,
+            },
+        )
+        return deepcopy(plan)
+
+    def cancel_compensation_adjustments(
+        self,
+        step_id: str | int,
+        effect_name: str,
+        plan_id: str,
+        *,
+        adjustment_id: str | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """Cancel adjustments that have not been sent; sent adjustments still require receipts."""
+        step_id = str(step_id)
+        name = str(effect_name)
+        plan_id = str(plan_id)
+        plan = self.compensation_adjustment_plan(step_id, name, plan_id)
+        targets = [op for op in plan["operations"] if adjustment_id is None or op["adjustment_id"] == str(adjustment_id)]
+        if adjustment_id is not None and not targets:
+            raise KeyError(f"adjustment {adjustment_id!r} is not part of plan {plan_id!r}")
+        if any(op["status"] in ("sending", "unconfirmed", "occurred") for op in targets):
+            raise CompensationError("only adjustments still queued can be cancelled; sent adjustments await receipts")
+        queued = [op for op in targets if op["status"] == "queued"]
+        if not queued:
+            return plan
+        record = self._compensation_record(step_id, name)
+        for queued_op in queued:
+            op = next(item for item in plan["operations"] if item["adjustment_id"] == queued_op["adjustment_id"])
+            self._release_adjustment(record, op, op["quantity_reserved"])
+            op["quantity_reserved"] = 0.0
+            op["status"] = "cancelled"
+        self._write_compensation(record)
+        self._write_adjustment_plan(plan)
+        self._append_compensation_audit(
+            record, "adjustment_cancellation", note,
+            {"plan_id": plan_id, "adjustment_id": adjustment_id, "count": len(queued)},
+        )
+        return deepcopy(plan)
 
     @staticmethod
     def _normalize_compensation_record(record: dict[str, Any]) -> dict[str, Any]:
         record.setdefault("quantity_pending", 0.0)
         record.setdefault("total_quantity_approved", record.get("quantity_allowed", 0.0))
         record.setdefault("quantity_withdrawn", 0.0)
+        record.setdefault("quantity_adjustment_reserved", 0.0)
         record.setdefault("attempts", [])
         if "recipients" not in record:
             record["recipients"] = {
@@ -286,6 +635,7 @@ class TrainingEventLog:
             recipient.setdefault("quantity_compensated", 0.0)
             recipient.setdefault("quantity_pending", 0.0)
             recipient.setdefault("quantity_withdrawn", 0.0)
+            recipient.setdefault("quantity_adjustment_reserved", 0.0)
         record["quantity_allowed"] = sum(
             float(item["quantity_allowed"]) for item in record["recipients"].values()
         )
@@ -298,6 +648,9 @@ class TrainingEventLog:
         record["total_quantity_allocated"] = float(record["quantity_allowed"])
         record["quantity_withdrawn"] = sum(
             float(item.get("quantity_withdrawn", 0.0)) for item in record["recipients"].values()
+        )
+        record["quantity_adjustment_reserved"] = sum(
+            float(item.get("quantity_adjustment_reserved", 0.0)) for item in record["recipients"].values()
         )
         return record
 
@@ -321,6 +674,7 @@ class TrainingEventLog:
             "total_quantity_approved": record.get("total_quantity_approved", record["quantity_allowed"]),
             "total_quantity_allocated": record.get("total_quantity_allocated", record["quantity_allowed"]),
             "quantity_withdrawn": record.get("quantity_withdrawn", 0.0),
+            "quantity_adjustment_reserved": record.get("quantity_adjustment_reserved", 0.0),
             "note": note,
         }
         payload.update(extra)
@@ -409,12 +763,14 @@ class TrainingEventLog:
                 "total_quantity_approved": allowed,
                 "total_quantity_allocated": allowed,
                 "quantity_withdrawn": 0.0,
+                "quantity_adjustment_reserved": 0.0,
                 "recipients": {
                     recipient_id: {
                         "quantity_allowed": value,
                         "quantity_compensated": inherited if recipient_id == "default" else 0.0,
                         "quantity_pending": 0.0,
                         "quantity_withdrawn": 0.0,
+                        "quantity_adjustment_reserved": 0.0,
                     }
                     for recipient_id, value in allocation_map.items()
                 },
@@ -498,7 +854,10 @@ class TrainingEventLog:
             raise CompensationError(f"compensation recipient {recipient_id!r} has no allocation")
         if recipient.get("quantity_withdrawn", 0.0) > 0 and recipient["quantity_compensated"] + recipient["quantity_pending"] <= 0:
             raise CompensationError(f"recipient {recipient_id!r} allocation was withdrawn")
-        remaining = recipient["quantity_allowed"] - recipient["quantity_compensated"] - recipient["quantity_pending"]
+        remaining = (
+            recipient["quantity_allowed"] - recipient["quantity_compensated"]
+            - recipient["quantity_pending"] - recipient.get("quantity_adjustment_reserved", 0.0)
+        )
         recipient_has_pending = recipient["quantity_pending"] > 0.0
         if recipient_has_pending:
             raise UnconfirmedEffectError(
@@ -739,20 +1098,23 @@ class TrainingEventLog:
                 "quantity_allowed": recipient["quantity_allowed"],
                 "quantity_compensated": recipient["quantity_compensated"],
                 "quantity_pending": recipient["quantity_pending"],
-                "quantity_available": recipient["quantity_allowed"] - committed,
+                "quantity_adjustment_reserved": recipient.get("quantity_adjustment_reserved", 0.0),
+                "quantity_available": recipient["quantity_allowed"] - committed - recipient.get("quantity_adjustment_reserved", 0.0),
                 "quantity_withdrawn": recipient.get("quantity_withdrawn", 0.0),
             }
         allocated = sum(item["quantity_allowed"] for item in recipients.values())
         withdrawn = sum(item.get("quantity_withdrawn", 0.0) for item in recipients.values())
         confirmed = sum(item["quantity_compensated"] for item in recipients.values())
         pending = sum(item["quantity_pending"] for item in recipients.values())
+        reserved = sum(item.get("quantity_adjustment_reserved", 0.0) for item in recipients.values())
         return {
             "total_quantity_approved": record["total_quantity_approved"],
             "total_quantity_allocated": allocated,
             "total_quantity_withdrawn": withdrawn,
             "total_quantity_compensated": confirmed,
             "total_quantity_pending": pending,
-            "total_quantity_available": allocated - confirmed - pending,
+            "total_quantity_adjustment_reserved": reserved,
+            "total_quantity_available": allocated - confirmed - pending - reserved,
             "recipients": recipient_report,
         }
 
@@ -831,7 +1193,10 @@ class TrainingEventLog:
         source = record["recipients"].get(source_recipient_id)
         if source is None:
             raise CompensationError(f"source recipient {source_recipient_id!r} has no allocation")
-        available = source["quantity_allowed"] - source["quantity_compensated"] - source["quantity_pending"]
+        available = (
+            source["quantity_allowed"] - source["quantity_compensated"]
+            - source["quantity_pending"] - source.get("quantity_adjustment_reserved", 0.0)
+        )
         if qty <= 0.0 or qty > available:
             raise CompensationError(
                 f"reallocation quantity {qty} must be within unused source quota {available}; "

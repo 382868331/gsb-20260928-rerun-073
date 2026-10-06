@@ -554,3 +554,144 @@ def test_multiple_recipients_reallocation_and_late_receipt_boundary(tmp_path):
     ]
     audit_notes = [event["payload"].get("note", "") for event in reopened.audit_events(0)]
     assert "move only unused quota" in audit_notes
+
+
+def test_batch_compensation_adjustments_conserve_quota_across_restarts(tmp_path):
+    path = tmp_path / "log.jsonl"
+    log = ad.TrainingEventLog(path)
+    run_completed_step(log, 0, effects=["register"])
+    log.decide_compensation(
+        0, "register", "compensate",
+        quantity=10.0, allocations={"vendor-a": 6.0, "vendor-b": 3.0, "vendor-c": 1.0},
+    )
+    log.run_compensation(
+        0, "register", lambda: {"offset": "a-1"},
+        quantity=1.0, recipient_id="vendor-a", attempt_id="a-1",
+    )
+    with pytest.raises(ad.ExternalEffectUncertain):
+        log.run_compensation(
+            0, "register",
+            lambda: (_ for _ in ()).throw(ad.ExternalEffectUncertain("b receipt lost")),
+            quantity=1.0, recipient_id="vendor-b", attempt_id="b-pending",
+        )
+
+    plan = log.propose_compensation_adjustments(
+        0, "register",
+        [
+            {"adjustment_id": "a-to-b", "action": "transfer", "source_recipient_id": "vendor-a", "target_recipient_id": "vendor-b", "quantity": 1.0},
+            {"adjustment_id": "a-to-c", "action": "transfer", "source_recipient_id": "vendor-a", "target_recipient_id": "vendor-c", "quantity": 1.0},
+            {"adjustment_id": "b-to-a", "action": "transfer", "source_recipient_id": "vendor-b", "target_recipient_id": "vendor-a", "quantity": 2.0},
+            {"adjustment_id": "c-to-b", "action": "transfer", "source_recipient_id": "vendor-c", "target_recipient_id": "vendor-b", "quantity": 1.0},
+            {"adjustment_id": "withdraw-1", "action": "withdraw", "source_recipient_id": "vendor-a", "quantity": 1.0},
+            {"adjustment_id": "withdraw-2", "action": "withdraw", "source_recipient_id": "vendor-a", "quantity": 1.0},
+        ],
+        plan_id="cycle-and-withdraw", note="atomic batch",
+    )
+    assert plan["status"] == "proposed"
+    allowance = log.compensation_allowance(0, "register")
+    assert allowance["total_quantity_pending"] == 1.0
+    assert allowance["total_quantity_adjustment_reserved"] == 7.0
+    assert allowance["total_quantity_available"] == 1.0
+    assert allowance["recipients"]["vendor-a"]["quantity_available"] == 1.0
+    assert allowance["recipients"]["vendor-b"]["quantity_available"] == 0.0
+    # A second plan cannot spend vendor-a's remaining unit twice or treat the
+    # pending vendor-b compensation as empty balance.
+    with pytest.raises(ad.CompensationError):
+        log.propose_compensation_adjustments(
+            0, "register",
+            [{"action": "transfer", "source_recipient_id": "vendor-a", "target_recipient_id": "vendor-b", "quantity": 2.0}],
+            plan_id="overdraw-a",
+        )
+    with pytest.raises(ad.CompensationError):
+        log.propose_compensation_adjustments(
+            0, "register",
+            [{"action": "withdraw", "source_recipient_id": "vendor-b", "quantity": 1.0}],
+            plan_id="spend-pending-b",
+        )
+    with pytest.raises(ad.CompensationError):
+        log.run_compensation(
+            0, "register", lambda: {"offset": "must-not-run"},
+            quantity=2.0, recipient_id="vendor-a", attempt_id="a-blocked-by-reservation",
+        )
+
+    reopened = ad.TrainingEventLog(path)
+    sent = []
+    reopened.execute_compensation_adjustment(
+        0, "register", "cycle-and-withdraw",
+        lambda op: sent.append((op["adjustment_id"], op["quantity"])) or {"sent": op["adjustment_id"]},
+        adjustment_id="a-to-b",
+    )
+    reopened.execute_compensation_adjustment(
+        0, "register", "cycle-and-withdraw",
+        lambda op: sent.append((op["adjustment_id"], op["quantity"])) or {"sent": op["adjustment_id"]},
+        adjustment_id="a-to-c",
+    )
+    with pytest.raises(ad.CompensationError):
+        reopened.cancel_compensation_adjustments(0, "register", "cycle-and-withdraw")
+    with pytest.raises(ad.ExternalEffectUncertain):
+        reopened.execute_compensation_adjustment(
+            0, "register", "cycle-and-withdraw",
+            lambda op: (_ for _ in ()).throw(ad.ExternalEffectUncertain("b adjustment timeout")),
+            adjustment_id="b-to-a",
+        )
+    with pytest.raises(ad.ExternalEffectNotExecuted):
+        reopened.execute_compensation_adjustment(
+            0, "register", "cycle-and-withdraw",
+            lambda op: (_ for _ in ()).throw(ad.ExternalEffectNotExecuted("c rejected")),
+            adjustment_id="c-to-b",
+        )
+
+    reopened = ad.TrainingEventLog(path)
+    plan = reopened.compensation_adjustment_plan(0, "register", "cycle-and-withdraw")
+    assert plan["status"] == "unconfirmed"
+    statuses = {op["adjustment_id"]: op["status"] for op in plan["operations"]}
+    assert statuses == {
+        "a-to-b": "occurred",
+        "a-to-c": "occurred",
+        "b-to-a": "unconfirmed",
+        "c-to-b": "not_occurred",
+        "withdraw-1": "queued",
+        "withdraw-2": "queued",
+    }
+    plan = reopened.verify_compensation_adjustment(
+        0, "register", "cycle-and-withdraw", "b-to-a", True, {"sent": 1},
+        quantity=1.0, receipt_id="b-partial", note="one of two arrived",
+    )
+    b_op = next(op for op in plan["operations"] if op["adjustment_id"] == "b-to-a")
+    assert b_op["status"] == "unconfirmed"
+    assert b_op["quantity_reserved"] == 1.0
+    duplicate = reopened.verify_compensation_adjustment(
+        0, "register", "cycle-and-withdraw", "b-to-a", True, {"sent": 1},
+        quantity=1.0, receipt_id="b-partial",
+    )
+    b_op = next(op for op in duplicate["operations"] if op["adjustment_id"] == "b-to-a")
+    assert b_op["quantity_settled"] == 1.0
+    with pytest.raises(ad.CompensationError):
+        reopened.verify_compensation_adjustment(
+            0, "register", "cycle-and-withdraw", "c-to-b", True, {"sent": 1},
+            receipt_id="b-partial",
+        )
+    reopened.verify_compensation_adjustment(
+        0, "register", "cycle-and-withdraw", "b-to-a", False,
+        receipt_id="b-final", note="remaining transfer did not happen",
+    )
+    reopened.execute_compensation_adjustment(
+        0, "register", "cycle-and-withdraw",
+        lambda op: sent.append((op["adjustment_id"], op["quantity"])) or {"sent": op["adjustment_id"]},
+        adjustment_id="withdraw-1",
+    )
+    reopened.cancel_compensation_adjustments(
+        0, "register", "cycle-and-withdraw", adjustment_id="withdraw-2",
+    )
+
+    final = reopened.compensation_allowance(0, "register")
+    assert final["total_quantity_approved"] == 10.0
+    assert final["total_quantity_allocated"] == 9.0
+    assert final["total_quantity_withdrawn"] == 1.0
+    assert final["total_quantity_compensated"] == 1.0
+    assert final["total_quantity_pending"] == 1.0
+    assert final["total_quantity_adjustment_reserved"] == 0.0
+    assert final["recipients"]["vendor-a"]["quantity_allowed"] == 4.0
+    assert final["recipients"]["vendor-b"]["quantity_allowed"] == 3.0
+    assert final["recipients"]["vendor-c"]["quantity_allowed"] == 2.0
+    assert sent == [("a-to-b", 1.0), ("a-to-c", 1.0), ("withdraw-1", 1.0)]
